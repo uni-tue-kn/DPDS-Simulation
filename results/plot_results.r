@@ -322,6 +322,7 @@ for (dist in distributions) {
         ggsave(
             file = paste0("combined_delay_", dist, "_", group_info$suffix, ".pdf"),
             plot = (plot_delay + group_info$data) & legend_theme & extra_guides,
+            device = cairo_pdf,
             width = 12, height = 5
         )
         cat(paste0("\nPlot saved as: combined_delay_", dist, "_", group_info$suffix, ".pdf\n"))
@@ -329,6 +330,7 @@ for (dist in distributions) {
         ggsave(
             file = paste0("combined_jitter_", dist, "_", group_info$suffix, ".pdf"),
             plot = (plot_jitter + group_info$data) & legend_theme & extra_guides,
+            device = cairo_pdf,
             width = 12, height = 5
         )
         cat(paste0("\nPlot saved as: combined_jitter_", dist, "_", group_info$suffix, ".pdf\n"))

@@ -252,6 +252,7 @@ plot_delay <- ggplot(df_aggregated, aes(
 ggsave(
     file = "distributions_delay.pdf",
     plot = plot_delay,
+    device = cairo_pdf,
     width = 12, height = 5
 )
 cat("\nPlot saved as: distributions_delay.pdf\n")
@@ -293,6 +294,7 @@ plot_jitter <- ggplot(df_aggregated, aes(
 ggsave(
     file = "distributions_jitter.pdf",
     plot = plot_jitter,
+    device = cairo_pdf,
     width = 12, height = 5
 )
 cat("\nPlot saved as: distributions_jitter.pdf\n")
@@ -344,6 +346,7 @@ plot_passage_time <- ggplot(df_passage_time, aes(
 ggsave(
     file = "distributions_passage_time.pdf",
     plot = plot_passage_time,
+    device = cairo_pdf,
     width = 12, height = 5
 )
 cat("\nPlot saved as: distributions_passage_time.pdf\n")
@@ -414,6 +417,7 @@ if (file.exists(benchmark_file)) {
     ggsave(
         file = "distributions_sampling_cost.pdf",
         plot = plot_sampling_cost,
+        device = cairo_pdf,
         width = 8, height = 5
     )
     cat("\nPlot saved as: distributions_sampling_cost.pdf\n")

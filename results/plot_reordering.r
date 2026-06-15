@@ -195,6 +195,7 @@ for (dist in distributions) {
     ggsave(
         file = paste0("combined_ooo_", dist, "_reordered_correlated.pdf"),
         plot = plot_ooo + legend_theme,
+        device = cairo_pdf,
         width = 12, height = 5
     )
     cat(paste0("\nPlot saved as: combined_ooo_", dist, "_reordered_correlated.pdf\n"))
@@ -244,6 +245,7 @@ for (dist in distributions) {
     ggsave(
         file = paste0("combined_ktau_", dist, "_reordered_correlated.pdf"),
         plot = plot_ktau + legend_theme,
+        device = cairo_pdf,
         width = 12, height = 5
     )
     cat(paste0("\nPlot saved as: combined_ktau_", dist, "_reordered_correlated.pdf\n"))

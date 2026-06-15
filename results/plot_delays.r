@@ -239,6 +239,7 @@ for (dist in distributions) {
     ggsave(
         file = paste0("delays_delay_", dist, ".pdf"),
         plot = plot_delay,
+        device = cairo_pdf,
         width = 12, height = 5
     )
     cat(paste0("\nPlot saved as: delays_delay_", dist, ".pdf\n"))
@@ -281,6 +282,7 @@ for (dist in distributions) {
     ggsave(
         file = paste0("delays_jitter_", dist, ".pdf"),
         plot = plot_jitter,
+        device = cairo_pdf,
         width = 12, height = 5
     )
     cat(paste0("\nPlot saved as: delays_jitter_", dist, ".pdf\n"))
