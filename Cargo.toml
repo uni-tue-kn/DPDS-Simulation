@@ -1,0 +1,33 @@
+[package]
+name = "dpds-simulation"
+version = "0.1.0"
+edition = "2024"
+description = "Discrete-event simulation of a network-link emulator (delay, jitter, rate limiting)."
+authors = ["Etienne Zink <etienne.zink@uni-tuebingen.de>"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/uni-tue-kn/DPDS-Simulation"
+
+[dependencies]
+dpds-core = { git = "https://github.com/uni-tue-kn/DPDS-Core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.3", features = ["full"] }
+hdrhistogram = "7.5.4"
+csv = "1.4.0"
+indicatif = "0.18.4"
+
+[dev-dependencies]
+test-case = "3.3.1"
+
+[lib]
+name = "lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dpds_simulation"
+path = "src/main.rs"
+
+[[bin]]
+name = "dpds_benchmark"
+path = "src/bench.rs"
