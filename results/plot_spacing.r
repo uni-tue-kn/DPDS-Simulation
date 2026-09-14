@@ -9,16 +9,16 @@ library(patchwork)
 
 # Define the parameters
 base_prefixes <- c("correlation30", "reorder")
-spacings <- c(0, 50, 80, 99)
+spacings <- c(0, 80, 99)
 delays <- c("10ms")
 jitters <- c("100us", "300us", "1000us", "3000us")
 rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.7
 
@@ -88,8 +88,8 @@ df$jitter_config <- factor(df$jitter_config,
 )
 
 df$spacing_config <- factor(df$spacing,
-    levels = c(0, 50, 80, 99),
-    labels = c("0%", "50%", "80%", "99%")
+    levels = c(0, 80, 99),
+    labels = c("0%", "80%", "99%")
 )
 
 ##################################################################################################
@@ -206,7 +206,8 @@ base_theme <- theme_minimal() +
         legend.position = "bottom",
         legend.text = element_text(size = font_size),
         legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -237,14 +238,14 @@ for (dist in distributions) {
             geom_point(size = point_size, position = dodge) +
             scale_x_continuous(breaks = rate_positions, labels = rate_levels) +
             scale_y_continuous(labels = label_number(big.mark = " ")) +
-            scale_color_manual(values = c("0%" = "#000000", "50%" = "#0072B2", "80%" = "#D55E00", "99%" = "#E69F00")) +
+            scale_color_manual(values = c("0%" = "#000000", "80%" = "#0072B2", "99%" = "#D55E00")) +
             scale_shape_manual(values = c("0.1 ms" = 16, "0.3 ms" = 17, "1 ms" = 15, "3 ms" = 18)) +
             guides(shape = guide_legend(order = 1), color = guide_legend(order = 2, override.aes = list(shape = NA, linewidth = 2))) +
             base_theme +
             legend_theme +
             labs(
                 x = "Rate (Gbit/s)",
-                y = "Mean delay deviation (%)",
+                y = "Mean delay\ndeviation (%)",
                 color = "Utilization",
                 shape = "Jitter"
             )
@@ -253,7 +254,7 @@ for (dist in distributions) {
             file = paste0("spacing_delay_", bp, "_", dist, ".pdf"),
             plot = plot_delay,
             device = cairo_pdf,
-            width = 12, height = 5
+            width = 14.4, height = 6
         )
         cat(paste0("\nPlot saved as: spacing_delay_", bp, "_", dist, ".pdf\n"))
 
@@ -280,14 +281,14 @@ for (dist in distributions) {
             scale_x_continuous(breaks = rate_positions, labels = rate_levels) +
             scale_y_continuous(labels = label_number(big.mark = " ")) +
             expand_limits(y = 0) +
-            scale_color_manual(values = c("0%" = "#000000", "50%" = "#0072B2", "80%" = "#D55E00", "99%" = "#E69F00")) +
+            scale_color_manual(values = c("0%" = "#000000", "80%" = "#0072B2", "99%" = "#D55E00")) +
             scale_shape_manual(values = c("0.1 ms" = 16, "0.3 ms" = 17, "1 ms" = 15, "3 ms" = 18)) +
             guides(shape = guide_legend(order = 1), color = guide_legend(order = 2, override.aes = list(shape = NA, linewidth = 2))) +
             base_theme +
             legend_theme +
             labs(
                 x = "Rate (Gbit/s)",
-                y = "Jitter deviation (%)",
+                y = "Jitter\ndeviation (%)",
                 color = "Utilization",
                 shape = "Jitter"
             )
@@ -296,7 +297,7 @@ for (dist in distributions) {
             file = paste0("spacing_jitter_", bp, "_", dist, ".pdf"),
             plot = plot_jitter,
             device = cairo_pdf,
-            width = 12, height = 5
+            width = 14.4, height = 6
         )
         cat(paste0("\nPlot saved as: spacing_jitter_", bp, "_", dist, ".pdf\n"))
     }

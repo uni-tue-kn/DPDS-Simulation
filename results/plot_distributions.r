@@ -15,9 +15,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal", "uniform", "gamma", "lognormal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.7
 
@@ -211,7 +211,8 @@ base_theme <- theme_minimal() +
         legend.position = "bottom",
         legend.text = element_text(size = font_size),
         legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -244,7 +245,7 @@ plot_delay <- ggplot(df_aggregated, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Mean delay deviation (%)",
+        y = "Mean delay\ndeviation (%)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -253,7 +254,7 @@ ggsave(
     file = "distributions_delay.pdf",
     plot = plot_delay,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_delay.pdf\n")
 
@@ -286,7 +287,7 @@ plot_jitter <- ggplot(df_aggregated, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Jitter deviation (%)",
+        y = "Jitter\ndeviation (%)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -295,7 +296,7 @@ ggsave(
     file = "distributions_jitter.pdf",
     plot = plot_jitter,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_jitter.pdf\n")
 
@@ -338,7 +339,7 @@ plot_passage_time <- ggplot(df_passage_time, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Passage time (ms)",
+        y = "Passage time\n(ms)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -347,7 +348,7 @@ ggsave(
     file = "distributions_passage_time.pdf",
     plot = plot_passage_time,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_passage_time.pdf\n")
 
@@ -405,20 +406,19 @@ if (file.exists(benchmark_file)) {
         expand_limits(y = 0) +
         scale_fill_manual(values = distribution_colors) +
         scale_color_manual(values = distribution_colors) +
-        guides(color = "none") +
+        guides(color = "none", fill = "none") +
         base_theme +
-        legend_theme +
+        theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
         labs(
             x = "Distribution",
-            y = "Sample generation rate (million/s)",
-            fill = "Distribution"
+            y = "Sample generation\nrate (million/s)"
         )
 
     ggsave(
         file = "distributions_sampling_cost.pdf",
         plot = plot_sampling_cost,
         device = cairo_pdf,
-        width = 8, height = 5
+        width = 12, height = 6.5
     )
     cat("\nPlot saved as: distributions_sampling_cost.pdf\n")
 } else {

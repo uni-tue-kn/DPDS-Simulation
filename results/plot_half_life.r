@@ -19,9 +19,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 3
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 5.3
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.5
 
@@ -160,7 +160,8 @@ base_theme <- theme_minimal() +
         legend.position = "bottom",
         legend.text = element_text(size = font_size),
         legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -199,7 +200,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Mean delay deviation (%)",
+            y = "Mean delay\ndeviation (%)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -232,7 +233,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Jitter deviation (%)",
+            y = "Jitter\ndeviation (%)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -265,7 +266,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Passage time (ms)",
+            y = "Passage time\n(ms)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -274,7 +275,7 @@ for (dist in distributions) {
         file = paste0("half_life_delay_", dist, ".pdf"),
         plot = plot_delay & legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: half_life_delay_", dist, ".pdf\n"))
 
@@ -282,7 +283,7 @@ for (dist in distributions) {
         file = paste0("half_life_jitter_", dist, ".pdf"),
         plot = plot_jitter & legend_theme,
         device = cairo_pdf,
-        width = 10, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: half_life_jitter_", dist, ".pdf\n"))
 
@@ -290,7 +291,7 @@ for (dist in distributions) {
         file = paste0("half_life_passage_time_", dist, ".pdf"),
         plot = plot_passage_time & legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: half_life_passage_time_", dist, ".pdf\n"))
 }

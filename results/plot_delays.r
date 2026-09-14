@@ -15,9 +15,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.7
 
@@ -194,7 +194,8 @@ base_theme <- theme_minimal() +
         legend.position = "bottom",
         legend.text = element_text(size = font_size),
         legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -231,7 +232,7 @@ for (dist in distributions) {
         legend_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Mean delay deviation (ms)",
+            y = "Mean delay\ndeviation (ms)",
             color = "Mean delay",
             shape = "Jitter"
         )
@@ -240,7 +241,7 @@ for (dist in distributions) {
         file = paste0("delays_delay_", dist, ".pdf"),
         plot = plot_delay,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: delays_delay_", dist, ".pdf\n"))
 
@@ -274,7 +275,7 @@ for (dist in distributions) {
         legend_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Jitter deviation (ms)",
+            y = "Jitter\ndeviation (ms)",
             color = "Mean delay",
             shape = "Jitter"
         )
@@ -283,7 +284,7 @@ for (dist in distributions) {
         file = paste0("delays_jitter_", dist, ".pdf"),
         plot = plot_jitter,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: delays_jitter_", dist, ".pdf\n"))
 }
