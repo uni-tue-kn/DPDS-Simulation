@@ -231,7 +231,7 @@ base_theme <- theme_minimal() +
         axis.line = element_line(),
         axis.ticks = element_line(),
         legend.position = "bottom",
-        legend.text = element_text(size = font_size),
+        legend.text = element_text(size = font_size, margin = margin(l = 8)),
         legend.title = element_text(size = font_size, face = "italic"),
         plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
         plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
