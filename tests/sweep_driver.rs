@@ -35,7 +35,7 @@ fn configs_json() -> String {
       "csv_output_path": "c_spacer.csv", "seed": 300}},
     "delay_config": {{"mean_ns": 100000, "std_ns": 30000, "rv_distribution": "UniformDistribution",
       "activate_correlation": false, "half_life_period_ns": 0}},
-    "limiter_config": {{"mode": "Spacer", "rate_bps": 800000000, "limit_bit": 1000000}}}}
+    "limiter_config": {{"mode": "Spacer", "rate_bps": 800000000}}}}
 ]"#
     )
 }
@@ -323,4 +323,50 @@ fn readme_documents_the_checkpoint_flags_and_the_buffer_capacity_default() {
             "stale 2^24: {line}"
         );
     }
+}
+
+#[test]
+fn readme_does_not_mention_limit_bit_and_explains_the_derived_limit() {
+    // dpds-core removed `LimiterConfig.limit_bit`: the limit of both limiter
+    // modes is `buffer_capacity * 1542 * 8` bit (derived_limit_bit).
+    let readme = read_repo_file("README.md");
+    for (n, line) in readme.lines().enumerate() {
+        assert!(
+            !line.contains("limit_bit"),
+            "README line {}: stale limit_bit: {line}",
+            n + 1
+        );
+    }
+    assert!(
+        readme.contains("1542"),
+        "README must state the derived limit (buffer_capacity * 1542 * 8 bit)"
+    );
+}
+
+#[test]
+fn a_config_with_limit_bit_makes_the_binary_fail_naming_the_key() {
+    let dir = std::env::temp_dir()
+        .join("dpds-simulation-tests")
+        .join(format!("limit-bit-rejected-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("simulation_configs.json"),
+        r#"[{"simulation_config": {"duration_s": 0.0004, "runs": 1, "rate_gbps": 1.2,
+      "average_frame_size_byte": 1480, "activate_reordering": false,
+      "csv_output_path": "stale.csv", "seed": 1},
+    "limiter_config": {"mode": "Spacer", "rate_bps": 800000000, "limit_bit": 1000000}}]"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dpds_simulation"))
+        .current_dir(&dir)
+        .output()
+        .expect("spawn dpds_simulation");
+    assert!(
+        !output.status.success(),
+        "a stale limit_bit must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("limit_bit"), "{stderr}");
+    assert!(!dir.join("results").join("stale.csv").exists());
 }

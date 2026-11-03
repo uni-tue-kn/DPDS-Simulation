@@ -156,8 +156,10 @@ ETA.
 Each run reserves 16 B per packet of `buffer_capacity` up front (32 MiB for
 the default 2^21 = 2097152). The buffer must never be the bottleneck, so the
 capacity has to exceed the number of packets in flight, about
-`rate_pps * (mean_ns + a few std_ns) / 1e9` plus the limiter's queue
-(`limit_bit / frame bits`). For the committed grid the largest value is the
+`rate_pps * (mean_ns + a few std_ns) / 1e9` plus the limiter's queue,
+which the buffer bounds as well: dpds-core derives the limiter limit as
+`buffer_capacity * 1542 B * 8` (1518 B maximum frame + 4 FEC + 20 B L1 overhead)
+and checks for buffer room before the delay, spacing and loss. For the committed grid the largest value is the
 100 Gbit/s, 100 ms configuration: 8.13 Mpps * 100 ms = 0.81 M packets, 0.96 M
 at mean + 6 std (a 0.6 s simulated run of its four jitter variants showed no
 `dropped_packets_buffer_full`). 2^21 therefore holds with a margin of about a
@@ -222,8 +224,7 @@ has a required `simulation_config` and optional `delay_config` and
   },
   "limiter_config": {                  // optional; omit for an unlimited link
     "mode": "Spacer",
-    "rate_bps": 1000000000,
-    "limit_bit": 1000000
+    "rate_bps": 1000000000            // the limit is derived from buffer_capacity
   }
 }
 ```

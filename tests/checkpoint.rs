@@ -115,7 +115,7 @@ fn config_json(csv: &str, runs: u32, seed: u64) -> Value {
             "mean_ns": 100000, "std_ns": 30000, "rv_distribution": "NormalDistribution",
             "activate_correlation": false, "half_life_period_ns": 0
         },
-        "limiter_config": {"mode": "Spacer", "rate_bps": 800000000, "limit_bit": 1000000}
+        "limiter_config": {"mode": "Spacer", "rate_bps": 800000000}
     })
 }
 
@@ -665,6 +665,7 @@ fn fingerprint_changes_with_every_field_that_affects_results() {
     variant("reordering_metric", &|v| {
         v["simulation_config"]["reordering_metric"] = json!("kendall_tau_distance")
     });
+    // also the limiter's limit: dpds-core derives it from the capacity
     variant("buffer_capacity", &|v| {
         v["simulation_config"]["buffer_capacity"] = json!(77)
     });
@@ -704,9 +705,6 @@ fn fingerprint_changes_with_every_field_that_affects_results() {
     });
     variant("limiter rate", &|v| {
         v["limiter_config"]["rate_bps"] = json!(800000001)
-    });
-    variant("limiter limit", &|v| {
-        v["limiter_config"]["limit_bit"] = json!(1000001)
     });
     variant("limiter removed", &|v| {
         v.as_object_mut().unwrap().remove("limiter_config");

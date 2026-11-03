@@ -124,7 +124,7 @@ fn initialization_rate_matches_exact_hand_values() {
 
 #[test]
 fn initialization_rate_is_set_in_every_config_shape() {
-    let limiter = json!({"mode": "Spacer", "rate_bps": 1e8, "limit_bit": 1e9});
+    let limiter = json!({"mode": "Spacer", "rate_bps": 1e8});
     let variants = [
         ("no delay, no limiter", None, None),
         ("no delay, limiter", None, Some(limiter.clone())),

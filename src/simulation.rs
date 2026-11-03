@@ -214,13 +214,11 @@ pub fn buffer_config(config: &Config, run: u32) -> BufferConfig {
             mode: limiter.mode,
             activate: true,
             rate_bps: limiter.rate_bps,
-            limit_bit: limiter.limit_bit,
         },
         None => LimiterConfig {
             mode: LimiterMode::Spacer,
             activate: false,
             rate_bps: 0.,
-            limit_bit: 0.,
         },
     };
     BufferConfig {

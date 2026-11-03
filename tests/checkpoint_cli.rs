@@ -360,8 +360,7 @@ fn config_json(
 }
 
 fn with_spacer(value: &mut Value) {
-    value["limiter_config"] =
-        json!({"mode": "Spacer", "rate_bps": 800000000, "limit_bit": 1000000});
+    value["limiter_config"] = json!({"mode": "Spacer", "rate_bps": 800000000});
 }
 
 fn with_loss(value: &mut Value) {

@@ -111,9 +111,14 @@ impl Scenario {
         }));
         self
     }
-    fn limiter(mut self, mode: &str, rate_bps: f64, limit_bit: f64) -> Self {
-        self.limiter = Some(json!({"mode": mode, "rate_bps": rate_bps, "limit_bit": limit_bit}));
+    /// The limiter has no limit of its own: dpds-core derives it from the
+    /// buffer capacity (`derived_limit_bit`, capacity x 12336 bit).
+    fn limiter(mut self, mode: &str, rate_bps: f64) -> Self {
+        self.limiter = Some(json!({"mode": mode, "rate_bps": rate_bps}));
         self
+    }
+    fn capacity(self, packets: usize) -> Self {
+        self.with("buffer_capacity", json!(packets))
     }
     fn build(&self) -> Config {
         let mut v = json!({ "simulation_config": self.sim.clone() });
@@ -382,9 +387,12 @@ fn csv_row_has_one_field_per_header_column_in_header_order() {
     let cfg = scenario()
         .with("loss_model", json!({"Random": 0.3}))
         .delay("NormalDistribution", 100_000., 30_000.)
-        .limiter("Spacer", 0.5e9, 100_000.)
+        .capacity(10)
+        .limiter("Spacer", 0.5e9)
         .build();
     let r = run_simulation(&cfg, 0);
+    // lost packets still consume spacing slots, so the derived limit
+    // (10 x 12336 bit) is reached although the buffer never needs to hold it
     assert!(r.dropped_packets_loss > 0 && r.dropped_packets_limiter > 0);
     let (header, row) = csv_row_of("row-shape", &r, 3);
     assert_eq!(row.len(), header.len());
@@ -791,13 +799,16 @@ fn kendall_tau_with_a_tiny_capacity_equals_the_inversions_of_the_survivors() {
 
 #[test]
 fn kendall_tau_with_limiter_drops_is_zero_because_the_survivors_stay_in_order() {
-    // Spacer at 0.5 Gbit/s under 1.2 Gbit/s offered load and a 100 kbit queue
-    // limit (drops), with delay jitter.
+    // Spacer at 0.5 Gbit/s under 1.2 Gbit/s offered load, with delay jitter.
+    // Lost packets consume spacing slots, so the derived limit (100 x 12336
+    // bit) is reached and the limiter drops as well.
     let cfg = kendall(
         scenario()
             .with("duration_s", json!(0.005))
+            .with("loss_model", json!({"Random": 0.3}))
+            .capacity(100)
             .delay("NormalDistribution", 300_000., 150_000.)
-            .limiter("Spacer", 0.5e9, 100_000.)
+            .limiter("Spacer", 0.5e9)
             .reorder(true),
     )
     .build();
@@ -816,7 +827,7 @@ fn kendall_tau_with_all_three_drop_causes_equals_the_survivor_inversions_zero() 
             .with("loss_model", json!({"Random": 0.2}))
             .with("buffer_capacity", json!(40))
             .delay("NormalDistribution", 400_000., 200_000.)
-            .limiter("Spacer", 0.9e9, 200_000.)
+            .limiter("Spacer", 0.9e9)
             .reorder(true),
     )
     .build();
@@ -914,26 +925,89 @@ fn out_of_order_counter_with_drops_still_matches_the_trace() {
 
 // ------------------------------------------------------------------ limiters
 
-/// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = (1480+4+20)*8 = 12032 bit
-/// -> 24064 ns of service, but one arrival per 10000 ns: a queue builds.
-/// Hand derivation: fill_pre(k) = 7032 k bit, send_k = 1e6 + 24064 k while the
-/// limit (100000 bit) is not hit (k <= 12); packet 13 would need
-/// 91416 + 12032 > 100000 and is dropped, packet 14 fits again (86416 + 12032).
+/// Service time of one packet at 0.5 bit/ns.
+const SERVICE_NS: u64 = 24_064;
+
+/// `dpds_core::derived_limit_bit(capacity)` = capacity * 1542 * 8 = 12336 *
+/// capacity bit (1518 B frame + 4 FEC + 20 L1, as the limiter counts a packet).
 #[test]
-fn spacer_below_offered_load_spaces_by_frame_plus_fec_plus_l1_and_drops_at_the_limit() {
+fn derived_limit_is_capacity_times_the_maximum_wire_frame() {
+    assert_eq!(dpds_core::MAX_FRAME_WIRE_BYTES, 1542);
+    assert_eq!(dpds_core::derived_limit_bit(1), 12_336.0);
+    assert_eq!(dpds_core::derived_limit_bit(40), 493_440.0);
+    assert_eq!(
+        dpds_core::derived_limit_bit(2_097_152),
+        2_097_152.0 * 12_336.0
+    );
+}
+
+/// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = 12032 bit -> 24064 ns of
+/// service, but one arrival per 10000 ns: a queue builds. With a delay of
+/// 300 us and a capacity of 20 packets (limit 246720 bit, about 20.5 packets)
+/// the buffer is the bottleneck: the queue the Spacer builds stays far below
+/// its limit while the 300 us delay keeps the buffer full, so arrivals are
+/// rejected as buffer-full. A buffer-full packet touches no limiter state,
+/// so the accepted packets keep EXACT spacing: every departure is
+/// 24064 ns after the previous one, the j-th is at 300000 + 24064 j (checked
+/// with an independent re-implementation of buffer.rs/limiter.rs; before the
+/// capacity check moved first, rejected packets advanced the Spacer and left
+/// gaps of 48128 ns and more).
+#[test]
+fn buffer_full_packets_do_not_advance_the_spacer() {
     let cfg = scenario()
-        .delay("DeterministicDistribution", 1_000_000., 0.)
-        .limiter("Spacer", 0.5e9, 100_000.)
+        .with("duration_s", json!(0.003))
+        .capacity(20)
+        .delay("DeterministicDistribution", 300_000., 0.)
+        .limiter("Spacer", 0.5e9)
         .build();
     let (r, deps) = trace(&cfg, 0);
+    assert_eq!(expected_arrivals(&cfg), 301);
+    assert_eq!(deps.len(), 133);
+    assert_eq!(r.tracked_packets, 133);
+    assert_eq!(r.dropped_packets_buffer_full, 168);
+    assert_eq!(r.dropped_packets_limiter, 0);
+    assert_eq!(r.dropped_packets_loss, 0);
+    for (j, d) in deps.iter().enumerate() {
+        assert_eq!(
+            d.send_time_ns,
+            300_000 + SERVICE_NS * j as u64,
+            "departure {j} (arrival {})",
+            d.seq
+        );
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
+    }
+    // the gaps in the arrival sequence prove that buffer-full drops happened
+    // in between: the first 20 packets are accepted back to back, then the
+    // buffer is full until the first one leaves at 300 us
+    let first_21: Vec<u64> = deps.iter().take(21).map(|d| d.seq).collect();
+    assert_eq!(
+        first_21,
+        (0..20).chain([30]).collect::<Vec<u64>>(),
+        "first accepted arrivals"
+    );
+}
 
-    let first_16: Vec<(u64, u64)> = deps
+/// Delay 1 ms and capacity 13: arrivals 0..12 fill the buffer and are
+/// spaced by the Spacer (send = 1e6 + 24064 k); 13..99 are rejected as
+/// buffer-full. When packet 0 leaves at 1 ms, arrival 100 (t = 1 ms, tie rule:
+/// transmit first) is accepted and finds an EMPTY Spacer: it leaves at exactly
+/// its own time-to-send, 2 ms. Had the 87 rejected packets been accounted, it
+/// would be queued behind their phantom backlog.
+#[test]
+fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
+    let cfg = scenario()
+        .capacity(13)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .limiter("Spacer", 0.5e9)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    let first_14: Vec<(u64, u64)> = deps
         .iter()
-        .take(16)
+        .take(14)
         .map(|d| (d.seq, d.send_time_ns))
         .collect();
     assert_eq!(
-        first_16,
+        first_14,
         vec![
             (0, 1_000_000),
             (1, 1_024_064),
@@ -948,32 +1022,77 @@ fn spacer_below_offered_load_spaces_by_frame_plus_fec_plus_l1_and_drops_at_the_l
             (10, 1_240_640),
             (11, 1_264_704),
             (12, 1_288_768),
-            (14, 1_312_832), // 13 was dropped
-            (17, 1_336_896),
-            (19, 1_360_960),
+            (100, 2_000_000),
         ]
     );
-    assert_eq!(deps.len(), 49);
-    assert_eq!(r.tracked_packets, 49);
-    assert_eq!(r.dropped_packets_limiter, 52);
+    assert_eq!(deps.len(), 14);
+    assert_eq!(r.dropped_packets_buffer_full, 87);
+    assert_eq!(r.dropped_packets_limiter, 0);
     assert_eq!(r.dropped_packets_loss, 0);
-    assert_eq!(r.dropped_packets_buffer_full, 0);
-    for pair in deps.windows(2) {
-        assert!(
-            pair[1].tx_time_ns - pair[0].tx_time_ns >= 24_064.,
-            "inter-departure below (frame+4+20)*8/rate"
+}
+
+/// Lost packets are accounted by the limiter (they consume spacing slots),
+/// buffer-full ones are not. Zero delay, Spacer at 0.5 bit/ns, capacity 2
+/// (limit 24672 bit = 2.05 packets): without loss the queue is the only thing
+/// that fills the Spacer, with 50 % loss the lost packets fill it as well and
+/// the limiter starts to reject packets that the buffer alone would have
+/// accepted.
+#[test]
+fn lost_packets_consume_spacing_slots_until_the_derived_limit_is_reached() {
+    for seed in 1..=5u64 {
+        let base = scenario().capacity(2).limiter("Spacer", 0.5e9);
+        let with_loss = base
+            .clone()
+            .with("seed", json!(seed))
+            .with("loss_model", json!({"Random": 0.5}))
+            .build();
+        let r = run_simulation(&with_loss, 0);
+        assert!(r.dropped_packets_loss > 0, "seed {seed}");
+        assert!(r.dropped_packets_limiter > 0, "seed {seed}");
+        assert_eq!(
+            total_drops(&r) + r.tracked_packets as u64,
+            101,
+            "seed {seed}"
         );
     }
-    for d in &deps {
-        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
-    }
+}
+
+/// Boundary of the derived limit of the SPACER. Rate 1e6 bit/s (drains
+/// 10 bit per arrival, negligible), zero delay, capacity 40: limit =
+/// 40 * 12336 = 493440 bit = 41.01 packets of 12032 bit, so the limiter lets
+/// exactly the first 41 pushes pass (41 * 12032 = 493312 <= 493440 < 42 *
+/// 12032) and rejects every later one. The Gilbert-Elliot model with
+/// p = r = 1, k = 1, h = 0 loses every second packet, starting with the second
+/// (the loss model is consulted for every pushed packet, also after the
+/// limiter has rejected it), and a lost packet takes precedence over a limiter
+/// rejection. Pushes 0..=40 pass the limiter: 21 survive (even indices).
+/// Pushes 41..=100: the odd ones (30) are Lost, the even ones (30) are
+/// LimiterDrop. A limit of 40 packets (12032 * 40, or 12304 * 40) would let
+/// only 20 survive.
+#[test]
+fn spacer_limit_is_the_derived_capacity_times_12336_bit() {
+    let cfg = scenario()
+        .capacity(40)
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [1.0, 1.0, 1.0, 0.0, true]}),
+        )
+        .limiter("Spacer", 1e6)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 21);
+    assert_eq!(r.dropped_packets_loss, 50);
+    assert_eq!(r.dropped_packets_limiter, 30);
+    assert_eq!(r.dropped_packets_buffer_full, 0);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, (0..=40).step_by(2).collect::<Vec<u64>>());
 }
 
 #[test]
 fn spacer_below_offered_load_without_limit_pressure_departs_every_24064_ns() {
     let cfg = scenario()
         .delay("DeterministicDistribution", 1_000_000., 0.)
-        .limiter("Spacer", 0.5e9, 1e12)
+        .limiter("Spacer", 0.5e9)
         .build();
     let (r, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 101);
@@ -988,7 +1107,7 @@ fn spacer_below_offered_load_without_limit_pressure_departs_every_24064_ns() {
 #[test]
 fn spacer_above_offered_load_neither_delays_nor_drops() {
     // 2 bit/ns: service 6016 ns < iat 10000 ns, the fill state is always empty.
-    let cfg = scenario().limiter("Spacer", 2e9, 100_000.).build();
+    let cfg = scenario().limiter("Spacer", 2e9).build();
     let (r, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 101);
     assert_eq!(total_drops(&r), 0);
@@ -1004,7 +1123,7 @@ fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
     // for float noise because the arrival spacing is not an integer here.
     let cfg = scenario()
         .with("average_frame_size_byte", json!(1479.2))
-        .limiter("Spacer", 0.5e9, 1e12)
+        .limiter("Spacer", 0.5e9)
         .build();
     let (_, deps) = trace(&cfg, 0);
     assert!(deps.len() > 20);
@@ -1014,20 +1133,22 @@ fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
     }
 }
 
-/// TBF at 0.5 bit/ns with a bucket of 3 packets (36096 bit, starts full): the
-/// bucket gains 5000 bit per arrival and a packet costs 12032 bit. Hand
-/// derivation (checked with an independent re-implementation of limiter.rs):
-/// accept 0,1,2,3 (fill 24064, 17032, 10000, 2968 after), drop 4 (7968 < 12032),
-/// accept 5, then 8, 10, 13, 15, 17, 20, 22, ... Out-of-budget packets are
+/// TBF at 0.5 bit/ns with capacity 3: the bucket is the derived 3 * 12336 =
+/// 37008 bit (starts full), gains 5000 bit per arrival and a packet costs
+/// 12032 bit. Zero delay, so the buffer never holds anything. Hand derivation
+/// (checked with an independent re-implementation of limiter.rs): accept
+/// 0,1,2,3 (37008 -> 24976, 17944, 10912, 3880 after), drop 4 (8880 < 12032),
+/// accept 5, then 8, 10, 12, 15, 17, 20, 22, ... Out-of-budget packets are
 /// dropped (not delayed) and accepted ones are not delayed either.
 #[test]
 fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
     let cfg = scenario()
-        .limiter("TokenBucketFilter", 0.5e9, 36_096.)
+        .capacity(3)
+        .limiter("TokenBucketFilter", 0.5e9)
         .build();
     let (r, deps) = trace(&cfg, 0);
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
-    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 13, 15, 17, 20, 22]);
+    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 12, 15, 17, 20, 22]);
     assert_eq!(deps.len(), 44);
     assert_eq!(r.dropped_packets_limiter, 57);
     assert_eq!(r.dropped_packets_loss, 0);
@@ -1035,6 +1156,61 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
     for d in &deps {
         assert_eq!(d.tx_time_ns, d.rx_time_ns, "TBF admits without delay");
     }
+}
+
+/// Boundary of the derived limit of the TOKEN BUCKET FILTER: the bucket
+/// starts full with `capacity * 12336` bit and, at 1000 bit/s (0.01 bit
+/// gained per arrival), is not refilled to speak of, so the number of
+/// admitted packets is `floor(capacity * 12336 / 12032)`: 1 for capacity 1
+/// and 2 for 2, but 39 for 39 (481104 bit: 39 * 12032 = 469248 leaves 11856 <
+/// 12032) and 41 for 40 (493440 >= 41 * 12032 = 493312). A limit of
+/// `capacity * 12032` bit would admit 40 for capacity 40.
+#[test]
+fn token_bucket_depth_is_the_derived_capacity_times_12336_bit() {
+    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 39), (40, 41), (41, 42)] {
+        let cfg = scenario()
+            .capacity(capacity)
+            .limiter("TokenBucketFilter", 1e3)
+            .build();
+        let (r, deps) = trace(&cfg, 0);
+        assert_eq!(deps.len(), admitted, "capacity {capacity}");
+        let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+        assert_eq!(seqs, (0..admitted as u64).collect::<Vec<_>>());
+        assert_eq!(
+            r.dropped_packets_limiter,
+            101 - admitted as u64,
+            "capacity {capacity}"
+        );
+        assert_eq!(r.dropped_packets_buffer_full + r.dropped_packets_loss, 0);
+    }
+}
+
+/// Capacity 3, TBF at 0.5 bit/ns, delay 1 ms (100 inter-arrival times).
+/// Arrivals 0,1,2 are accepted (bucket 37008 -> 10912 bit) and fill the
+/// buffer; 3..99 are rejected as buffer-full and must NOT consume tokens: at
+/// arrival 100 (tie rule: packet 0 leaves first) the bucket has refilled
+/// completely, so 100, 101, 102 are accepted again, and so on. The cycle
+/// repeats every 100 arrivals: accepted = k with k % 100 < 3. No arrival is
+/// ever limiter-dropped. (With the old order, 3 consumed tokens and 4.. were
+/// limiter drops.)
+#[test]
+fn buffer_full_packets_do_not_consume_token_bucket_tokens() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.0035))
+        .capacity(3)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .limiter("TokenBucketFilter", 0.5e9)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(expected_arrivals(&cfg), 351);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 100, 101, 102, 200, 201, 202, 300, 301, 302]
+    );
+    assert_eq!(r.dropped_packets_buffer_full, 339);
+    assert_eq!(r.dropped_packets_limiter, 0);
+    assert_eq!(r.dropped_packets_loss, 0);
 }
 
 // ---------------------------------------------------------- capacity and ties
@@ -1179,22 +1355,75 @@ fn gilbert_elliot_loss_model_is_applied() {
     assert_eq!(r.dropped_packets_loss, 100);
 }
 
+/// TBF at 0.5 bit/ns with capacity 1 (bucket 12336 bit, starts full), zero
+/// delay: the bucket gains 5000 bit per arrival and a packet costs 12032 bit,
+/// so every third arrival (k % 3 == 0: 34 of 101) is admitted and the other 67
+/// are rejected by the limiter.
+fn tight_token_bucket() -> Scenario {
+    scenario().capacity(1).limiter("TokenBucketFilter", 0.5e9)
+}
+
 #[test]
 fn loss_takes_precedence_over_limiter_drop_in_the_counters() {
-    // The limiter (limit 1 bit) would reject every packet, the loss model
-    // rejects every packet too: dpds-core reports Lost.
-    let cfg = scenario()
+    // The limiter would reject 67 of the packets, the loss model rejects
+    // every packet: dpds-core reports Lost.
+    let cfg = tight_token_bucket()
         .with("loss_model", json!({"Random": 1.0}))
-        .limiter("Spacer", 0.5e9, 1.0)
         .build();
     let r = run_simulation(&cfg, 0);
     assert_eq!(r.dropped_packets_loss, 101);
     assert_eq!(r.dropped_packets_limiter, 0);
-    // without loss the same limiter drops everything
-    let cfg = scenario().limiter("Spacer", 0.5e9, 1.0).build();
-    let r = run_simulation(&cfg, 0);
-    assert_eq!(r.dropped_packets_limiter, 101);
+    // without loss the same limiter drops those 67
+    let (r, deps) = trace(&tight_token_bucket().build(), 0);
+    assert_eq!(r.dropped_packets_limiter, 67);
     assert_eq!(r.dropped_packets_loss, 0);
+    assert_eq!(r.dropped_packets_buffer_full, 0);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, (0..=99).step_by(3).collect::<Vec<u64>>());
+}
+
+#[test]
+fn buffer_full_takes_precedence_over_loss_and_limiter_in_the_counters() {
+    // Capacity 0: the buffer rejects everything before the loss model (which
+    // would also reject everything) or the limiter (derived limit 0 bit,
+    // would reject everything) is consulted.
+    for limiter in ["Spacer", "TokenBucketFilter"] {
+        let cfg = scenario()
+            .capacity(0)
+            .with("loss_model", json!({"Random": 1.0}))
+            .limiter(limiter, 0.5e9)
+            .build();
+        let (r, deps) = trace(&cfg, 0);
+        assert!(deps.is_empty(), "{limiter}");
+        assert_eq!(r.dropped_packets_buffer_full, 101, "{limiter}");
+        assert_eq!(r.dropped_packets_loss, 0, "{limiter}");
+        assert_eq!(r.dropped_packets_limiter, 0, "{limiter}");
+    }
+}
+
+/// Capacity 1, delay 1 ms, Gilbert-Elliot with p = 1, k = 1, h = 0 (first
+/// packet survives, every later one is lost). Arrival 0 is accepted and
+/// fills the buffer; 1..99 are rejected as buffer-full and must not consume a
+/// loss draw (the model would move on to its lossy state); at arrival 100
+/// (packet 0 leaves first, tie rule) the model is therefore still at its
+/// second draw and loses it. 99 buffer-full, 1 lost, 1 accepted. (With the old
+/// order the model had already been advanced by arrival 1: 100 lost, 0 full.)
+#[test]
+fn buffer_full_packets_consume_no_loss_draw() {
+    let cfg = scenario()
+        .capacity(1)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [1.0, 0.0, 1.0, 0.0, true]}),
+        )
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].seq, 0);
+    assert_eq!(r.dropped_packets_buffer_full, 99);
+    assert_eq!(r.dropped_packets_loss, 1);
+    assert_eq!(r.dropped_packets_limiter, 0);
 }
 
 #[test]
@@ -1204,7 +1433,7 @@ fn drop_causes_are_conserved_with_all_three_active() {
         .with("loss_model", json!({"Random": 0.2}))
         .with("buffer_capacity", json!(10))
         .delay("NormalDistribution", 100_000., 30_000.)
-        .limiter("Spacer", 0.9e9, 200_000.)
+        .limiter("Spacer", 0.9e9)
         .build();
     let (r, deps) = trace(&cfg, 0);
     assert_eq!(deps.len() as u64 + total_drops(&r), expected_arrivals(&cfg));

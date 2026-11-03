@@ -42,9 +42,11 @@ pub struct DelayConfig {
     pub half_life_period_ns: f64,
 }
 
+/// The limiter's limit is not configured: dpds-core derives it as
+/// `buffer_capacity * MAX_FRAME_WIRE_BYTES (1542) * 8` for both modes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimiterConfig {
     pub mode: LimiterMode,
     pub rate_bps: f64,
-    pub limit_bit: f64,
 }
