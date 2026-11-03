@@ -11,7 +11,7 @@
 //! repeated 10 times so the throughput numbers carry statistical significance.
 //!
 //! Usage:
-//!   dpds_sampling_benchmark [N_SAMPLES] [RUNS]
+//!   dpds_benchmark [N_SAMPLES] [RUNS]
 //!
 //! N_SAMPLES defaults to 1000000000 and RUNS to 10. The optional arguments exist
 //! only for quick sanity runs with smaller counts.

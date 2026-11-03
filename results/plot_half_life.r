@@ -77,11 +77,11 @@ for (memory in memories) {
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), ")"
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), ")"
     ))
 }
 

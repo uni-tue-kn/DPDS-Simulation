@@ -1,333 +1,556 @@
-use dpds_core::{
-    delayer::{Delayer, RVDistribution},
-    limiter::{Limiter, LimiterMode},
-};
+//! Sweep driver: runs every `(config, run)` job of `simulation_configs.json`
+//! on a rayon pool and checkpoints after every completed run, so an
+//! interrupted sweep can be resumed (see the README).
+
 use lib::{
-    config::{Config, SimulationConfig},
-    context::SimulationContext,
-    events::{Event, EventKind, PacketArrivalEvent, PacketTransmissionEvent},
-    results::SimulationResults,
-    statistics::ReorderingMetric,
+    checkpoint::{self, Checkpoint, ConfigProgress},
+    config::Config,
+    results::csv_bytes,
+    simulation::{arrivals_per_run, run_simulation},
 };
 
-use csv::Writer;
+use chrono::Timelike;
 use indicatif::{ProgressBar, ProgressStyle};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use std::cell::RefCell;
 use std::env;
-use std::fs::{self, File};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Semaphore;
+use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RESULT_DIR: &str = "results";
-const DEFAULT_MAX_CONCURRENT_SIMULATIONS: usize = 2;
+const CONFIG_FILE: &str = "simulation_configs.json";
+/// Exit code after a second Ctrl+C (128 + SIGINT).
+const SECOND_SIGNAL_EXIT_CODE: i32 = 130;
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[tokio::main]
-async fn main() {
-    // Read simulation configurations from JSON file
-    let config_file = fs::read_to_string("simulation_configs.json")
-        .expect("Failed to read simulation_configs.json");
+const USAGE: &str = "usage: dpds_simulation [--resume | --fresh] [--dry-run] \
+[--stop-at HH:MM] [--start-at HH:MM]";
 
-    let configs: Vec<Config> =
-        serde_json::from_str(&config_file).expect("Failed to parse simulation_configs.json");
+// ----------------------------------------------------------------- arguments
 
-    // Read MAX_CONCURRENT_SIMULATIONS from environment variable or use default
-    let max_concurrent_simulations = env::var("MAX_CONCURRENT_SIMULATIONS")
+#[derive(Debug, Default)]
+struct Args {
+    resume: bool,
+    fresh: bool,
+    dry_run: bool,
+    /// Time of day (local), as the offset from midnight.
+    stop_at: Option<Duration>,
+    start_at: Option<Duration>,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut parsed = Args::default();
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--resume" => parsed.resume = true,
+            "--fresh" => parsed.fresh = true,
+            "--dry-run" => parsed.dry_run = true,
+            "--stop-at" | "--start-at" => {
+                let value = args.next().ok_or(format!("{arg} needs a value HH:MM"))?;
+                let time = parse_time_of_day(&value).ok_or(format!(
+                    "{arg}: {value:?} is not a time HH:MM (00:00-23:59)"
+                ))?;
+                if arg == "--stop-at" {
+                    parsed.stop_at = Some(time);
+                } else {
+                    parsed.start_at = Some(time);
+                }
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                exit(0);
+            }
+            _ => return Err(format!("unknown argument {arg:?}\n{USAGE}")),
+        }
+    }
+    if parsed.resume && parsed.fresh {
+        return Err("--resume and --fresh are mutually exclusive".to_string());
+    }
+    Ok(parsed)
+}
+
+/// `H:MM`/`HH:MM` (one or two digits each, hour 0-23, minute 0-59).
+fn parse_time_of_day(text: &str) -> Option<Duration> {
+    let (hours, minutes) = text.split_once(':')?;
+    let number = |s: &str| {
+        (matches!(s.len(), 1 | 2) && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let (hours, minutes) = (number(hours)?, number(minutes)?);
+    (hours < 24 && minutes < 60).then(|| Duration::from_secs(hours * 3600 + minutes * 60))
+}
+
+/// The local time of day now. `DPDS_SIM_FAKE_NOW=HH:MM:SS` replaces it (a
+/// test seam for the time flags).
+fn time_of_day_now() -> Duration {
+    if let Ok(fake) = env::var("DPDS_SIM_FAKE_NOW") {
+        let parts: Vec<u64> = fake.split(':').filter_map(|p| p.parse().ok()).collect();
+        if let [h, m, s] = parts[..] {
+            return Duration::from_secs(h * 3600 + m * 60 + s);
+        }
+        fail(&format!("DPDS_SIM_FAKE_NOW must be HH:MM:SS, got {fake:?}"));
+    }
+    let now = chrono::Local::now().time();
+    Duration::new(u64::from(now.num_seconds_from_midnight()), now.nanosecond())
+}
+
+/// How long until the next occurrence of `target` (a time that already
+/// passed, or is now, means tomorrow).
+fn time_until(target: Duration, now: Duration) -> Duration {
+    if target > now {
+        target - now
+    } else {
+        target + DAY - now
+    }
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("error: {message}");
+    exit(1)
+}
+
+// ------------------------------------------------------------------ plan/jobs
+
+/// Run-major job list over the runs not yet in the checkpoint: run 0 of
+/// every config, then run 1 of every config that has one, and so on.
+fn pending_jobs(configs: &[Config], checkpoint: &Checkpoint) -> Vec<(usize, u32)> {
+    let max_runs = configs
+        .iter()
+        .map(|c| c.simulation_config.runs)
+        .max()
+        .unwrap_or(0);
+    (0..max_runs)
+        .flat_map(|run| {
+            configs
+                .iter()
+                .enumerate()
+                .filter(move |(_, c)| c.simulation_config.runs > run)
+                .map(move |(i, _)| (i, run))
+        })
+        .filter(|&(i, run)| {
+            let csv = &configs[i].simulation_config.csv_output_path;
+            !checkpoint.configs[csv].rows.contains_key(&run)
+        })
+        .collect()
+}
+
+fn print_dry_run(configs: &[Config], checkpoint: Option<&Checkpoint>) {
+    let mut jobs = 0;
+    let mut packets = 0;
+    println!("Sweep plan:");
+    for config in configs {
+        let sim = &config.simulation_config;
+        let per_run = arrivals_per_run(sim);
+        println!(
+            "  {}: {} runs x {per_run} packets",
+            sim.csv_output_path, sim.runs
+        );
+        jobs += u64::from(sim.runs);
+        packets += u64::from(sim.runs) * per_run;
+    }
+    println!(
+        "{} configs, {jobs} jobs, about {packets} simulated packets",
+        configs.len()
+    );
+    match checkpoint {
+        Some(cp) => {
+            let (done, total) = cp.progress();
+            println!("Checkpoint: {done}/{total} runs completed");
+        }
+        None => println!("Checkpoint: none"),
+    }
+}
+
+// --------------------------------------------------------- checkpoint at start
+
+fn checkpoint_path() -> PathBuf {
+    Path::new(RESULT_DIR).join(checkpoint::FILE_NAME)
+}
+
+const UNUSABLE_HINT: &str =
+    "Fix the problem, or start over with --fresh (this deletes the checkpoint).";
+
+/// Loads the checkpoint and checks that it belongs to `configs`: same
+/// fingerprint, and (should the file have been edited) the same config keys
+/// with the same run counts. The error names the file and `--fresh`.
+fn load_matching(path: &Path, configs: &[Config]) -> Result<Checkpoint, String> {
+    let unusable = |what: String| format!("{}: {what}\n{UNUSABLE_HINT}", path.display());
+    let loaded = checkpoint::load(path).map_err(|e| format!("{e}\n{UNUSABLE_HINT}"))?;
+    if loaded.fingerprint != checkpoint::fingerprint(configs) {
+        return Err(unusable(format!(
+            "the checkpoint was made for other configs than {CONFIG_FILE}"
+        )));
+    }
+    for config in configs {
+        let sim = &config.simulation_config;
+        match loaded.configs.get(&sim.csv_output_path) {
+            Some(progress) if progress.runs == sim.runs => {}
+            Some(progress) => {
+                return Err(unusable(format!(
+                    "{} has {} runs in the checkpoint but {} in {CONFIG_FILE}",
+                    sim.csv_output_path, progress.runs, sim.runs
+                )));
+            }
+            None => {
+                return Err(unusable(format!(
+                    "{} is missing in the checkpoint",
+                    sim.csv_output_path
+                )));
+            }
+        }
+    }
+    if loaded.configs.len() != configs.len() {
+        return Err(unusable(
+            "the checkpoint has configs that are not in the current configs".to_string(),
+        ));
+    }
+    Ok(loaded)
+}
+
+fn describe(cp: &Checkpoint) -> String {
+    let (done, total) = cp.progress();
+    let age_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(cp.updated_unix_s);
+    format!(
+        "{done}/{total} runs completed in {} configs, last updated {}h {:02}m ago",
+        cp.configs.len(),
+        age_s / 3600,
+        age_s % 3600 / 60
+    )
+}
+
+/// `y`/`n` on stdin, asked again after anything else. EOF is an error.
+fn ask(question: &str) -> Result<bool, String> {
+    let mut stdin = io::stdin().lock();
+    loop {
+        print!("{question} [y/n] ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let n = stdin
+            .read_line(&mut line)
+            .map_err(|e| format!("cannot read the answer: {e}"))?;
+        if n == 0 {
+            return Err(format!("no answer on stdin to \"{question}\""));
+        }
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("Please answer y or n."),
+        }
+    }
+}
+
+/// Decides how to start: an existing checkpoint is resumed, or deleted
+/// (`--fresh` or the prompt), or the start is refused with an error. A
+/// checkpoint that cannot be used is never replaced silently.
+fn start_checkpoint(args: &Args, configs: &[Config]) -> Result<Checkpoint, String> {
+    let path = checkpoint_path();
+    if !path.exists() {
+        return Ok(Checkpoint::new(configs));
+    }
+    if args.fresh {
+        remove_checkpoint(&path)?;
+        return Ok(Checkpoint::new(configs));
+    }
+    let loaded = load_matching(&path, configs)?;
+    println!("Found checkpoint {}: {}", path.display(), describe(&loaded));
+    if args.resume {
+        return Ok(loaded);
+    }
+    let interactive =
+        io::stdin().is_terminal() || env::var("DPDS_SIM_FORCE_PROMPT").is_ok_and(|v| v == "1");
+    if !interactive {
+        return Err("a checkpoint exists and stdin is not a terminal: \
+pass --resume to continue it or --fresh to delete it and start over"
+            .to_string());
+    }
+    if ask("Resume it?")? {
+        return Ok(loaded);
+    }
+    if ask("Really delete the checkpoint and start fresh?")? {
+        remove_checkpoint(&path)?;
+        return Ok(Checkpoint::new(configs));
+    }
+    Err("checkpoint left untouched".to_string())
+}
+
+fn remove_checkpoint(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(format!("cannot delete {}: {e}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+// ------------------------------------------------------------------------ sweep
+
+thread_local! {
+    /// The job this thread is simulating, for the panic message.
+    static CURRENT_JOB: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// A panic inside a simulation names its job and ends the process (also with
+/// `panic = "abort"`, where unwinding cannot be relied on). Runs completed
+/// before are already checkpointed.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        match CURRENT_JOB.with(|job| job.borrow_mut().take()) {
+            Some(job) => {
+                eprintln!("\nerror: {job} panicked: {info}");
+                eprintln!(
+                    "Completed runs are checkpointed; fix the problem and rerun with --resume."
+                );
+                exit(1)
+            }
+            None => default_hook(info),
+        }
+    }));
+}
+
+struct Sweep<'a> {
+    configs: &'a [Config],
+    jobs: Vec<(usize, u32)>,
+    next_job: AtomicUsize,
+    /// Set by the first SIGINT/SIGTERM.
+    signalled: Arc<AtomicBool>,
+    /// Set once the `--stop-at` deadline has passed (independent of signals).
+    deadline_hit: AtomicBool,
+    stop_deadline: Option<Instant>,
+    checkpoint: Mutex<Checkpoint>,
+    progress: ProgressBar,
+}
+
+impl Sweep<'_> {
+    /// One worker: takes jobs in order until none are left or a stop is
+    /// requested. A job that was started is always finished and checkpointed.
+    fn work(&self) {
+        loop {
+            if self.stop_requested() {
+                return;
+            }
+            let Some(&(config_index, run)) =
+                self.jobs.get(self.next_job.fetch_add(1, Ordering::Relaxed))
+            else {
+                return;
+            };
+            let config = &self.configs[config_index];
+            let csv = &config.simulation_config.csv_output_path;
+            let job = format!("{csv} run {run}");
+            self.progress.set_message(job.clone());
+
+            CURRENT_JOB.with(|current| *current.borrow_mut() = Some(job));
+            let row = run_simulation(config, run).csv_record(run).to_vec();
+            CURRENT_JOB.with(|current| *current.borrow_mut() = None);
+
+            self.complete(csv, run, row);
+            self.progress.inc(1);
+        }
+    }
+
+    /// A signal arrived or the `--stop-at` deadline passed while jobs were
+    /// still to be handed out.
+    fn stop_requested(&self) -> bool {
+        if self.signalled.load(Ordering::Relaxed) || self.deadline_hit.load(Ordering::Relaxed) {
+            return true;
+        }
+        let jobs_left = self.next_job.load(Ordering::Relaxed) < self.jobs.len();
+        if jobs_left
+            && self.stop_deadline.is_some_and(|d| Instant::now() >= d)
+            && !self.deadline_hit.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "\nThe --stop-at deadline is reached: no new runs are started, waiting for \
+the runs in flight to finish and be checkpointed."
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Records the run, saves the checkpoint and, if the config is now
+    /// complete, writes its CSV.
+    fn complete(&self, csv: &str, run: u32, row: Vec<String>) {
+        let mut checkpoint = self
+            .checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        checkpoint.record(csv, run, row);
+        let path = checkpoint_path();
+        checkpoint::save(&path, &checkpoint)
+            .unwrap_or_else(|e| fail(&format!("cannot save {}: {e}", path.display())));
+        if checkpoint.configs[csv].is_complete() {
+            write_csv(csv, &checkpoint.configs[csv]);
+        }
+    }
+}
+
+/// Writes the CSV of a config from its checkpointed rows (sorted by run). A
+/// failure ends the process with an error message (runs are checkpointed).
+fn write_csv(csv: &str, progress: &ConfigProgress) {
+    let path = Path::new(RESULT_DIR).join(csv);
+    let bytes = csv_bytes(progress.rows.values())
+        .unwrap_or_else(|e| fail(&format!("cannot build {}: {e}", path.display())));
+    checkpoint::write_atomic(&path, &bytes)
+        .unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", path.display())));
+}
+
+/// `MAX_CONCURRENT_SIMULATIONS` if it is a positive integer, otherwise the
+/// available parallelism.
+fn worker_count() -> usize {
+    env::var("MAX_CONCURRENT_SIMULATIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_SIMULATIONS);
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()))
+}
 
-    // Create a semaphore to limit concurrent simulations
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_simulations));
+/// Waits until `delay` has passed; returns false if a signal arrived.
+fn wait(delay: Duration, signalled: &AtomicBool) -> bool {
+    let end = Instant::now() + delay;
+    while Instant::now() < end {
+        if signalled.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100).min(end - Instant::now()));
+    }
+    true
+}
 
-    let total_runs: u64 = configs
+fn main() {
+    let args = parse_args(env::args().skip(1)).unwrap_or_else(|e| fail(&e));
+
+    let config_text = fs::read_to_string(CONFIG_FILE)
+        .unwrap_or_else(|e| fail(&format!("cannot read {CONFIG_FILE}: {e}")));
+    let configs: Vec<Config> = serde_json::from_str(&config_text)
+        .unwrap_or_else(|e| fail(&format!("cannot parse {CONFIG_FILE}: {e}")));
+    let mut csv_paths: Vec<&str> = configs
         .iter()
-        .map(|c| c.simulation_config.runs as u64)
-        .sum();
-    let pb = ProgressBar::new(total_runs);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    for config in configs.into_iter() {
-        let runs = config.simulation_config.runs;
-        let csv_output_path = config.simulation_config.csv_output_path.clone();
-
-        // Ensure results directory exists
-        fs::create_dir_all(RESULT_DIR).expect("Failed to create results directory");
-
-        // Create CSV writer with mutex for thread-safe writing
-        let file = File::create(format!("{RESULT_DIR}/{csv_output_path}"))
-            .unwrap_or_else(|_| panic!("Failed to create CSV file: {}", csv_output_path));
-        let csv_writer = Arc::new(Mutex::new(Writer::from_writer(file)));
-
-        // Write CSV header
-        {
-            let mut writer = csv_writer.lock().unwrap();
-            writer
-                .write_record([
-                    "run",
-                    "tracked_packets",
-                    "inter_arrival_time_mean_ns",
-                    "inter_arrival_time_std_ns",
-                    "delay_mean_ns",
-                    "delay_std_ns",
-                    "kendall_tau_distance",
-                    "kendall_tau_distance_div_n",
-                    "out_of_order_packets",
-                    "out_of_order_packets_div_n",
-                    "tracked_theoretical_passage_times",
-                    "theoretical_passage_time_mean_ns",
-                    "theoretical_passage_time_std_ns",
-                    "tracked_measured_passage_times",
-                    "measured_passage_time_mean_ns",
-                    "measured_passage_time_std_ns",
-                    "dropped_packets_bandwidth",
-                    "burst_spacing_offset_mean_ns",
-                    "burst_spacing_offset_std_ns",
-                    "burst_spacing_offset_max_ns",
-                    "dropped_packets_burst_virtual_queue",
-                ])
-                .expect("Failed to write CSV header");
-            writer.flush().expect("Failed to flush CSV header");
-        }
-
-        // Collect all simulation tasks for one config
-        let mut tasks = Vec::new();
-
-        for run in 0..runs {
-            let config_clone = config.clone();
-            let csv_output_path_clone = csv_output_path.clone();
-            let csv_writer_clone = Arc::clone(&csv_writer);
-            let semaphore_clone = Arc::clone(&semaphore);
-            let pb_clone = pb.clone();
-            let task = tokio::spawn(async move {
-                // Acquire semaphore permit before starting simulation
-                let _permit = semaphore_clone.acquire().await.unwrap();
-                pb_clone.set_message(format!("{csv_output_path_clone} run {}/{}", run + 1, runs));
-                let results = run_simulation(config_clone);
-                results
-                    .write_to_csv(&csv_writer_clone, run)
-                    .expect("Failed to write results to CSV");
-                pb_clone.inc(1);
-                // Permit is automatically released when _permit is dropped
-            });
-            tasks.push(task);
-        }
-
-        for task in tasks {
-            task.await.expect("Simulation task panicked");
-        }
+        .map(|c| c.simulation_config.csv_output_path.as_str())
+        .collect();
+    csv_paths.sort_unstable();
+    if let Some(pair) = csv_paths.windows(2).find(|pair| pair[0] == pair[1]) {
+        fail(&format!(
+            "{CONFIG_FILE}: csv_output_path {:?} is used twice",
+            pair[0]
+        ));
     }
 
-    pb.finish_with_message("All simulations completed");
-}
-
-fn run_simulation(config: Config) -> SimulationResults {
-    // Initialize simulation context with all running variables
-    let mut simulation_context = initialize_simulation_context(&config);
-
-    let simulation_config = &config.simulation_config;
-
-    let rate_pps = simulation_config.rate_gbps * 1e9
-        / ((simulation_config.average_frame_size_byte + 20.) * 8.);
-    let rx_inter_arrival_time_ns = 1e9 / rate_pps;
-    let simulation_duration_ns = (simulation_config.duration_s * 1e9).round() as u64;
-
-    // Do the simulation
-    while !simulation_context.events_is_empty() {
-        let event = simulation_context.events_pop();
-
-        // Do not go back in time, even when the packet was scheduled for the past and needs to be send immediately
-        simulation_context.current_simulation_time_ns = f64::max(
-            simulation_context.current_simulation_time_ns,
-            event.time_ns(),
-        );
-
-        match event.kind() {
-            // Only add new packet arrivals until simulation end is reached
-            EventKind::PacketArrival(current_arrival_event)
-                if simulation_context.current_simulation_time_ns
-                    <= simulation_duration_ns as f64 =>
-            {
-                let next_arrival_event =
-                    PacketArrivalEvent::new(current_arrival_event.sequence_number() + 1);
-
-                // Push new packet arrival
-                simulation_context.events_push(Event::new(
-                    simulation_context.current_simulation_time_ns + rx_inter_arrival_time_ns,
-                    EventKind::PacketArrival(next_arrival_event),
-                ));
-
-                // Process this packet for transmission
-                let delay_ns = simulation_context
-                    .delayer
-                    .delayer_sample_ns(simulation_context.current_simulation_time_ns);
-
-                // Record theoretical passage time directly after sampling the delay
-                simulation_context.statistics.record_theoretical_delay(
-                    delay_ns,
-                    simulation_context.current_simulation_time_ns,
-                );
-
-                let time_to_send_ns = simulation_context.current_simulation_time_ns + delay_ns;
-
-                let transmission_event = if simulation_config.activate_reordering {
-                    EventKind::PacketTransmissionOrderTime(PacketTransmissionEvent::new(
-                        simulation_context.current_simulation_time_ns,
-                        current_arrival_event.sequence_number(),
-                    ))
-                } else {
-                    EventKind::PacketTransmissionOrderSequence(PacketTransmissionEvent::new(
-                        simulation_context.current_simulation_time_ns,
-                        current_arrival_event.sequence_number(),
-                    ))
-                };
-
-                simulation_context.events_push(Event::new(time_to_send_ns, transmission_event));
-            }
-            EventKind::PacketArrival(_) => continue,
-            EventKind::PacketTransmissionOrderSequence(packet_transmission_event) => {
-                handle_packet_transmission(
-                    simulation_config,
-                    &mut simulation_context,
-                    packet_transmission_event,
-                )
-            }
-            EventKind::PacketTransmissionOrderTime(packet_transmission_event) => {
-                handle_packet_transmission(
-                    simulation_config,
-                    &mut simulation_context,
-                    packet_transmission_event,
-                )
-            }
-        }
-    }
-
-    simulation_context.statistics.get_results()
-}
-
-fn initialize_simulation_context(config: &Config) -> SimulationContext {
-    let simulation_config = &config.simulation_config;
-    // Use the configured reordering metric or fall back to the default (OutOfOrderCounter)
-    let reordering_metric = simulation_config
-        .reordering_metric
-        .unwrap_or(ReorderingMetric::OutOfOrderCounter);
-    let rate_pps = simulation_config.rate_gbps * 1e9
-        / ((simulation_config.average_frame_size_byte + 20.) * 8.);
-    // Process delay config
-    let delay_config = &config.delay_config;
-    let delayer = match delay_config {
-        Some(delay_config) => Delayer::new(
-            delay_config.rv_distribution,
-            delay_config.mean_ns,
-            delay_config.std_ns,
-            delay_config.activate_correlation,
-            delay_config.half_life_period_ns,
-            rate_pps,
-        ),
-        None => Delayer::new(
-            RVDistribution::DeterministicDistribution,
-            0.,
-            0.,
-            false,
-            0.,
-            0.,
-        ),
-    };
-
-    // Process limiter config
-    let limiter_config = &config.limiter_config;
-    let limiter = match limiter_config {
-        Some(limiter_config) => Limiter::new(
-            limiter_config.mode,
-            true,
-            limiter_config.rate_bps,
-            limiter_config.limit_bit,
-        ),
-        None => Limiter::new(LimiterMode::Spacer, false, 0., 0.),
-    };
-
-    // Use X% utilization for virtual queue -> div by X%
-    let virtual_queue_rate_bps = simulation_config.rate_gbps * 1e9 / 0.90;
-    let burst_virtual_queue =
-        Limiter::new(LimiterMode::Spacer, true, virtual_queue_rate_bps, f64::MAX);
-
-    let mut context =
-        SimulationContext::new(delayer, limiter, burst_virtual_queue, reordering_metric);
-
-    // Initialize passage time tracker if delay config is present
-    if let Some(delay_config) = delay_config {
-        context
-            .statistics
-            .init_passage_time_tracker(delay_config.mean_ns, delay_config.std_ns);
-    }
-
-    context
-}
-
-fn handle_packet_transmission(
-    simulation_config: &SimulationConfig,
-    simulation_context: &mut SimulationContext,
-    packet_transmission_event: &PacketTransmissionEvent,
-) {
-    // Do not measure statistics of first packet to send
-    if simulation_context.last_transmission_time_ns == 0. {
-        simulation_context.last_transmission_time_ns =
-            simulation_context.current_simulation_time_ns;
+    if args.dry_run {
+        let path = checkpoint_path();
+        let checkpoint = path
+            .exists()
+            .then(|| load_matching(&path, &configs).unwrap_or_else(|e| fail(&e)));
+        print_dry_run(&configs, checkpoint.as_ref());
         return;
     }
 
-    let limiter_result = simulation_context.limiter.limiter_calculate_offset_ns(
-        simulation_context.current_simulation_time_ns,
-        simulation_config.average_frame_size_byte.ceil() as u32,
+    let checkpoint = start_checkpoint(&args, &configs).unwrap_or_else(|e| fail(&e));
+
+    // Set by the first SIGINT/SIGTERM, and only by a signal.
+    let signalled = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM] {
+        // Registered in this order: a signal that arrives while `signalled`
+        // is already set exits at once (second Ctrl+C), the first one sets it.
+        signal_hook::flag::register_conditional_shutdown(
+            signal,
+            SECOND_SIGNAL_EXIT_CODE,
+            Arc::clone(&signalled),
+        )
+        .and_then(|_| signal_hook::flag::register(signal, Arc::clone(&signalled)))
+        .unwrap_or_else(|e| fail(&format!("cannot install the signal handler: {e}")));
+    }
+
+    let mut now = time_of_day_now();
+    if let Some(start_at) = args.start_at {
+        let delay = time_until(start_at, now);
+        println!("Waiting {}s until --start-at.", delay.as_secs());
+        if !wait(delay, &signalled) {
+            fail("interrupted while waiting for --start-at; nothing was run");
+        }
+        // The sweep starts at --start-at: --stop-at counts from there.
+        now = start_at;
+    }
+    let stop_deadline = args.stop_at.map(|t| Instant::now() + time_until(t, now));
+
+    fs::create_dir_all(RESULT_DIR)
+        .unwrap_or_else(|e| fail(&format!("cannot create {RESULT_DIR}: {e}")));
+    install_panic_hook();
+
+    // Configs that are already complete (a resumed checkpoint, or no runs).
+    for (csv, progress) in checkpoint.configs.iter().filter(|(_, p)| p.is_complete()) {
+        write_csv(csv, progress);
+    }
+
+    let jobs = pending_jobs(&configs, &checkpoint);
+    let (done, total) = checkpoint.progress();
+    let progress = ProgressBar::new(total as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (ETA {eta}) {msg}",
+            )
+            .expect("valid progress template")
+            .progress_chars("#>-"),
     );
+    progress.set_position(done as u64);
+    // The ETA must not count the resumed runs as done in no time.
+    progress.reset_eta();
 
-    if let Some(transmission_offset_ns) = limiter_result {
-        // Update time to sent with the limiter offset
-        simulation_context.current_simulation_time_ns += transmission_offset_ns;
-    } else {
-        simulation_context
-            .statistics
-            .record_dropped_packet_bandwidth();
+    let sweep = Sweep {
+        configs: &configs,
+        jobs,
+        next_job: AtomicUsize::new(0),
+        signalled,
+        deadline_hit: AtomicBool::new(false),
+        stop_deadline,
+        checkpoint: Mutex::new(checkpoint),
+        progress,
+    };
+    if !sweep.jobs.is_empty() {
+        // The signal handler only sets a flag: this thread prints.
+        let signalled = Arc::clone(&sweep.signalled);
+        thread::spawn(move || {
+            while !signalled.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!(
+                "\nInterrupted: waiting for the runs in flight to finish and be checkpointed. \
+Press Ctrl+C again to exit immediately."
+            );
+        });
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count().min(sweep.jobs.len()))
+            .build()
+            .unwrap_or_else(|e| fail(&format!("cannot start the worker pool: {e}")));
+        pool.broadcast(|_| sweep.work());
     }
 
-    // Max with 0 to compensate if a packet should have been sent in the past and therefore needs to be sent immediately
-    let inter_arrival_time_ns = (simulation_context.current_simulation_time_ns
-        - simulation_context.last_transmission_time_ns)
-        .max(0.);
-
-    simulation_context
-        .statistics
-        .record_inter_arrival_time(inter_arrival_time_ns);
-
-    simulation_context.last_transmission_time_ns = simulation_context.current_simulation_time_ns;
-
-    let delay_ns =
-        simulation_context.current_simulation_time_ns - packet_transmission_event.rx_timestamp_ns();
-    simulation_context
-        .statistics
-        .record_delay(delay_ns, simulation_context.current_simulation_time_ns);
-
-    // Record sequence number for Kendall Tau Distance calculation
-    simulation_context
-        .statistics
-        .record_sequence_number(packet_transmission_event.sequence_number());
-
-    let burst_offset = simulation_context
-        .burst_virtual_queue
-        .limiter_calculate_offset_ns(
-            simulation_context.current_simulation_time_ns,
-            simulation_config.average_frame_size_byte.ceil() as u32,
+    let checkpoint = sweep
+        .checkpoint
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let (done, total) = checkpoint.progress();
+    if done < total {
+        sweep.progress.abandon();
+        eprintln!(
+            "Stopped with {done}/{total} runs completed. Continue with: dpds_simulation --resume"
         );
-    if let Some(offset_ns) = burst_offset {
-        simulation_context
-            .statistics
-            .record_burst_spacing_offset(offset_ns);
-    } else {
-        simulation_context
-            .statistics
-            .record_dropped_packet_burst_virtual_queue();
+        exit(1);
     }
+    remove_checkpoint(&checkpoint_path()).unwrap_or_else(|e| fail(&e));
+    sweep
+        .progress
+        .finish_with_message("All simulations completed");
 }

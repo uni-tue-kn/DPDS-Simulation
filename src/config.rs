@@ -1,5 +1,5 @@
 use crate::statistics::ReorderingMetric;
-use dpds_core::{delayer::RVDistribution, limiter::LimiterMode};
+use dpds_core::{delayer::RVDistribution, dropper::LossModel, limiter::LimiterMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +21,16 @@ pub struct SimulationConfig {
     pub csv_output_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reordering_metric: Option<ReorderingMetric>,
+    /// Capacity of the `dpds-core` buffer in packets (default: 2^21, large
+    /// enough not to bind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_capacity: Option<usize>,
+    /// Packet loss model of the `dpds-core` buffer (default: `Random(0.0)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_model: Option<LossModel>,
+    /// Base seed: run `r` is seeded with `seed + r` (default: OS entropy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

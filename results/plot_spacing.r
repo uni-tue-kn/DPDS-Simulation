@@ -95,11 +95,11 @@ df$spacing_config <- factor(df$spacing,
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), ")"
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), ")"
     ))
 }
 
@@ -157,8 +157,8 @@ df_aggregated <- df %>%
         iat_deviation_pct_sd = sd(iat_deviation_pct),
         iat_cvar_avg = mean(iat_cvar),
         iat_cvar_sd = sd(iat_cvar),
-        dropped_packets_bandwidth_avg = mean(dropped_packets_bandwidth),
-        dropped_packets_bandwidth_sd = sd(dropped_packets_bandwidth),
+        dropped_packets_limiter_avg = mean(dropped_packets_limiter),
+        dropped_packets_limiter_sd = sd(dropped_packets_limiter),
         burst_spacing_offset_mean_ns_avg = mean(burst_spacing_offset_mean_ns),
         burst_spacing_offset_mean_ns_sd = sd(burst_spacing_offset_mean_ns),
         burst_spacing_offset_max_ns_avg = mean(burst_spacing_offset_max_ns),

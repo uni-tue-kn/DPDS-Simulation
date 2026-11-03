@@ -78,19 +78,19 @@ df$jitter_config <- factor(df$jitter_config,
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     run_details <- paste(
-        apply(dropped_bw, 1, function(r) paste0(
+        apply(dropped_lim, 1, function(r) paste0(
             "  ", r["prefix"], "/", r["distribution"], "/", r["delay_config"], "/",
             r["jitter_config"], "/", r["rate_config"],
-            " (dropped: ", r["dropped_packets_bandwidth"], ")"
+            " (dropped: ", r["dropped_packets_limiter"], ")"
         )),
         collapse = "\n"
     )
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), "):\n",
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), "):\n",
         run_details
     ))
 }
@@ -152,8 +152,8 @@ df_aggregated <- df %>%
         iat_deviation_pct_sd = sd(iat_deviation_pct),
         iat_cvar_avg = mean(iat_cvar),
         iat_cvar_sd = sd(iat_cvar),
-        dropped_packets_bandwidth_avg = mean(dropped_packets_bandwidth),
-        dropped_packets_bandwidth_sd = sd(dropped_packets_bandwidth),
+        dropped_packets_limiter_avg = mean(dropped_packets_limiter),
+        dropped_packets_limiter_sd = sd(dropped_packets_limiter),
         burst_spacing_offset_mean_ns_avg = mean(burst_spacing_offset_mean_ns),
         burst_spacing_offset_mean_ns_sd = sd(burst_spacing_offset_mean_ns),
         burst_spacing_offset_max_ns_avg = mean(burst_spacing_offset_max_ns),
@@ -177,7 +177,7 @@ df_aggregated <- df_aggregated %>%
         jitter_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_pct_sd / sqrt(n_runs)),
         iat_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (iat_deviation_pct_sd / sqrt(n_runs)),
         iat_cvar_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (iat_cvar_sd / sqrt(n_runs)),
-        dropped_packets_bandwidth_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (dropped_packets_bandwidth_sd / sqrt(n_runs)),
+        dropped_packets_limiter_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (dropped_packets_limiter_sd / sqrt(n_runs)),
         burst_spacing_offset_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (burst_spacing_offset_mean_ns_sd / sqrt(n_runs)),
         burst_spacing_offset_max_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (burst_spacing_offset_max_ns_sd / sqrt(n_runs))
     )

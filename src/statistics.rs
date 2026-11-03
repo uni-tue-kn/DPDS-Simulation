@@ -291,7 +291,9 @@ pub struct SimulationStatistics {
     measured_pt_tracker: Option<PassageTimeTracker>,
     theoretical_passage_time_ns: Histogram<u64>,
     theoretical_pt_tracker: Option<PassageTimeTracker>,
-    dropped_packets_bandwidth: u64,
+    dropped_packets_loss: u64,
+    dropped_packets_limiter: u64,
+    dropped_packets_buffer_full: u64,
     burst_spacing_offset_ns: Histogram<u64>,
     dropped_packets_burst_virtual_queue: u64,
 }
@@ -312,7 +314,9 @@ impl SimulationStatistics {
             measured_pt_tracker: None,
             theoretical_passage_time_ns: Histogram::<u64>::new(3).unwrap(),
             theoretical_pt_tracker: None,
-            dropped_packets_bandwidth: 0,
+            dropped_packets_loss: 0,
+            dropped_packets_limiter: 0,
+            dropped_packets_buffer_full: 0,
             burst_spacing_offset_ns: Histogram::<u64>::new(3).unwrap(),
             dropped_packets_burst_virtual_queue: 0,
         }
@@ -353,8 +357,16 @@ impl SimulationStatistics {
         }
     }
 
-    pub fn record_dropped_packet_bandwidth(&mut self) {
-        self.dropped_packets_bandwidth += 1;
+    pub fn record_dropped_packet_loss(&mut self) {
+        self.dropped_packets_loss += 1;
+    }
+
+    pub fn record_dropped_packet_limiter(&mut self) {
+        self.dropped_packets_limiter += 1;
+    }
+
+    pub fn record_dropped_packet_buffer_full(&mut self) {
+        self.dropped_packets_buffer_full += 1;
     }
 
     pub fn record_burst_spacing_offset(&mut self, offset_ns: f64) {
@@ -455,7 +467,9 @@ impl SimulationStatistics {
             tracked_measured_passage_times: self.measured_passage_time_ns.len() as usize,
             measured_passage_time_mean_ns: self.measured_passage_time_ns.mean(),
             measured_passage_time_std_ns: self.measured_passage_time_ns.stdev(),
-            dropped_packets_bandwidth: self.dropped_packets_bandwidth,
+            dropped_packets_loss: self.dropped_packets_loss,
+            dropped_packets_limiter: self.dropped_packets_limiter,
+            dropped_packets_buffer_full: self.dropped_packets_buffer_full,
             burst_spacing_offset_mean_ns: self.burst_spacing_offset_ns.mean(),
             burst_spacing_offset_std_ns: self.burst_spacing_offset_ns.stdev(),
             burst_spacing_offset_max_ns: self.burst_spacing_offset_ns.max(),
