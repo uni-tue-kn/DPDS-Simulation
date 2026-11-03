@@ -18,6 +18,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Pinned so a new stable release can't turn CI red on an unchanged tree; bump deliberately.
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Cache cargo
