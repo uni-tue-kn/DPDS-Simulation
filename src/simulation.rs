@@ -186,8 +186,11 @@ pub fn arrivals_per_run(sim: &SimulationConfig) -> u64 {
 }
 
 /// The `dpds-core` configuration for run `run` of `config`.
-fn buffer_config(config: &Config, run: u32) -> BufferConfig {
+pub fn buffer_config(config: &Config, run: u32) -> BufferConfig {
     let sim = &config.simulation_config;
+    // The correlated delayer starts from the offered packet rate: the arrival
+    // rate of this run's fixed inter-arrival process (dpds-core requires it).
+    let initialization_rate_pps = 1e9 / inter_arrival_time_ns(sim);
     let delayer = match &config.delay_config {
         Some(delay) => DelayerConfig {
             distribution: delay.rv_distribution,
@@ -195,6 +198,7 @@ fn buffer_config(config: &Config, run: u32) -> BufferConfig {
             std_ns: delay.std_ns,
             activate_correlation: delay.activate_correlation,
             half_life_period_ns: delay.half_life_period_ns,
+            initialization_rate_pps,
         },
         None => DelayerConfig {
             distribution: RVDistribution::DeterministicDistribution,
@@ -202,6 +206,7 @@ fn buffer_config(config: &Config, run: u32) -> BufferConfig {
             std_ns: 0.,
             activate_correlation: false,
             half_life_period_ns: 0.,
+            initialization_rate_pps,
         },
     };
     let limiter = match &config.limiter_config {

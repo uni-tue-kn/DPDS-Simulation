@@ -312,8 +312,9 @@ of the paper):
 - New optional config fields `buffer_capacity`, `loss_model`, `seed`.
 - Results include the 4 FEC bytes `dpds-core` adds to every frame for the
   limiter (the burst virtual queue does not).
-- The correlated delayer is initialised with `dpds-core`'s fixed 15 Mpps rate
-  instead of the offered rate of the config.
+- The correlated delayer starts from the config's offered packet rate
+  (`initialization_rate_pps` = 1e9 / inter-arrival time in ns, a required
+  `dpds-core` field), as the old model did; it is derived, not a config field.
 - Every departure is tracked; the old model skipped the first packet.
   `inter_arrival_time_*` describes the `n - 1` departure gaps.
 - Theoretical passage times use the buffer's whole-ns send time minus the
