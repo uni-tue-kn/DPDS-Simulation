@@ -8,14 +8,15 @@ inter-arrival time (jitter), packet reordering, delay *passage times*, burst
 spacing, and packet drops.
 
 It is the simulation companion to the
-[`dpds-core`](https://github.com/uni-tue-kn/DPDS-Core) crate, which provides the underlying
+[`dpds-core`](https://github.com/uni-tue-kn/DPDS/tree/nightly/crates/dpds-core) crate
+(part of [DPDS](https://github.com/uni-tue-kn/DPDS)), which provides the underlying
 delayer and limiter models. The simulation sweeps a large grid of link
 configurations, writes per-run results to CSV, and ships R scripts that turn
 those CSVs into the plots used for analysis.
 
 ## Requirements
 
-- **Rust**
+- **Rust** 1.99 or newer (the toolchain `dpds-core` is developed and tested with).
 - Network access to fetch the `dpds-core` git dependency at build time
   (see [Dependencies](#dependencies)).
 - **R** with `ggplot2`, `dplyr`, `tidyr`, `magrittr`, `scales`, and `patchwork`.
@@ -129,9 +130,51 @@ See `results/Makefile` for individual targets.
 
 ## Dependencies
 
-This crate depends on `dpds-core`, fetched as a git dependency in
-`Cargo.toml`. The committed `Cargo.lock` pins the exact revision used, so builds
-are reproducible. To update to a newer `dpds-core`, run `cargo update`.
+This crate depends on the `dpds-core` crate of the
+[DPDS](https://github.com/uni-tue-kn/DPDS) repository, fetched as a git
+dependency on its `nightly` branch (Cargo finds the package inside the DPDS
+workspace by name):
+
+```toml
+dpds-core = { git = "https://github.com/uni-tue-kn/DPDS", branch = "nightly" }
+```
+
+The committed `Cargo.lock` pins the exact revision used, so builds are
+reproducible. To update to a newer `dpds-core`, run `cargo update -p dpds-core`.
+The simulation only uses `dpds-core`'s `Delayer`, `Limiter`, `RVDistribution`
+and `LimiterMode` (it does not use `Buffer`, `Dropper` or `Config`). It relies
+on the serde derives of `RVDistribution` and `LimiterMode`, which come from
+`dpds-core`'s default `json` feature (implies `serde`).
+
+### Building against a local DPDS checkout
+
+To build against a local DPDS working tree (for example to try unpushed
+changes) without editing `Cargo.toml`, override the dependency on the command
+line:
+
+```sh
+cargo test --config 'patch."https://github.com/uni-tue-kn/DPDS".dpds-core.path="../DPDS/crates/dpds-core"'
+```
+
+Use the same `--config` flag for `cargo build`, `cargo run`, `cargo clippy`,
+and so on. Cargo rewrites `Cargo.lock` while the patch is active (the
+`dpds-core` entry loses its git `source`). Do not commit that; afterwards
+restore the lockfile with `git checkout Cargo.lock` (or run a plain `cargo
+build` without the flag).
+
+### Behaviour of the `dpds-core` model
+
+Compared with the former `DPDS-Core` crate, the delayer in `dpds-core` changed
+in ways that alter the simulation results for correlated delays:
+
+- **Start-up fix.** The correlated delay spread is now derived from the
+  correlation weight from the very first packet. Previously the first
+  roughly 10 ms of every run sampled with an almost vanishing delay spread.
+- **Rate update period.** The packet-rate estimate that adapts the correlation
+  weight is refreshed every 1 ms instead of every 10 ms. At low offered loads
+  (about 8 packets per ms at 0.1 Gbit/s) this estimate is coarser than before.
+
+The limiter (`Spacer` and `TokenBucketFilter`) is unchanged.
 
 ## Tests
 

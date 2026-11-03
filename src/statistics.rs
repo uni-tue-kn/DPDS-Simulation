@@ -77,13 +77,13 @@ impl MissingRankTree {
     }
 
     /// Add `delta` to cell `i`, updating every slot that covers it by walking
-    /// up the tree (`i += lowbit(i)`). `i.wrapping_neg()` is `-i` for unsigned,
-    /// so `i & i.wrapping_neg()` is `lowbit(i)`.
+    /// up the tree (`i += lowbit(i)`), where `lowbit(i)` is
+    /// `i.isolate_lowest_one()`.
     fn point_add(&mut self, mut i: usize, delta: i64) {
         let cap = self.cap();
         while i <= cap {
             self.tree[i] += delta;
-            i += i & i.wrapping_neg();
+            i += i.isolate_lowest_one();
         }
     }
 
@@ -93,7 +93,7 @@ impl MissingRankTree {
         let mut sum = 0;
         while i > 0 {
             sum += self.tree[i];
-            i -= i & i.wrapping_neg();
+            i -= i.isolate_lowest_one();
         }
         sum
     }
@@ -194,7 +194,7 @@ impl MissingRankTree {
         // Invert the Fenwick construction in place so `tree[i]` holds the raw
         // per-index count again.
         for i in (1..=cap).rev() {
-            let j = i + (i & i.wrapping_neg());
+            let j = i + i.isolate_lowest_one();
             if j <= cap {
                 self.tree[j] -= self.tree[i];
             }
