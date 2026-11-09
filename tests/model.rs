@@ -14,15 +14,16 @@
 //!     seq: u64,          // arrival index 0,1,2,..; counts EVERY arrival, so
 //!                        // dropped packets leave gaps
 //!     rx_time_ns: f64,   // `now` passed to push_outcome
-//!     send_time_ns: u64, // `Accepted { send_time_ns }` of push_outcome
+//!     send_time_ns: u64, // send time from pop_due_with_time (whole ns)
 //!     tx_time_ns: f64,   // simulation time of the transmit event (pop time)
 //! }
 //! lib::simulation::DEFAULT_BUFFER_CAPACITY: usize = 1 << 21
-//! lib::results::CSV_HEADER: [&str; 23] or &[&str]   // the 23 column names, see csv_header_is_exact
-//! lib::results::SimulationResults
-//!     - dropped_packets_bandwidth REMOVED
-//!     + dropped_packets_loss: u64, dropped_packets_limiter: u64,
-//!       dropped_packets_buffer_full: u64      (all other fields unchanged)
+//! lib::results::CSV_HEADER: [&str; 8] or &[&str]    // the 8 column names, see csv_header_is_exact
+//! lib::results::SimulationResults                   // only fields that feed a CSV column:
+//!     delay_mean_ns, delay_std_ns, kendall_tau_distance_div_n,
+//!     out_of_order_packets, theoretical_passage_time_mean_ns,
+//!     dropped_packets_limiter: u64   // sanity check: limiter rejections
+//!     dropped_packets_buffer_full: u64  // arrivals rejected as BufferFull (last CSV column)
 //! lib::config::SimulationConfig (all `#[serde(default, skip_serializing_if = "Option::is_none")]`)
 //!     + buffer_capacity: Option<usize>   // default (None): 2^21 (`DEFAULT_BUFFER_CAPACITY`)
 //!     + loss_model: Option<dpds_core::dropper::LossModel>  // None = Random(0.0)
@@ -44,15 +45,13 @@
 //! * TIE RULE at equal times: a transmit event at time t is processed BEFORE an
 //!   arrival at time t (so a buffer slot freed at t is usable by an arrival at
 //!   t). Pinned by `equal_time_transmit_is_processed_before_arrival_*`.
-//! * EVERY departure is tracked (no "skip the first packet" as in the old
-//!   code): `tracked_packets` = number of departures; the inter-departure
-//!   histogram has n-1 samples; the burst virtual queue sees every departure.
-//! * Theoretical passage time: tracker fed at arrival of every ACCEPTED packet
-//!   with `send_time_ns - rx_time` (u64 truncation included) at time rx.
-//!   Measured: fed at every departure with `tx - rx` at time tx.
-//! * Burst virtual queue (as before): `Limiter::new(Spacer, true,
-//!   rate_gbps*1e9/0.90, f64::MAX)` called at the departure time with
-//!   `frame.ceil()` bytes, i.e. WITHOUT the +4 bytes.
+//! * EVERY departure is tracked: the statistics' denominator (`div_n`) is the
+//!   number of departures. Drops are not reported, so tests derive them from
+//!   the trace (arrivals minus departures).
+//! * Theoretical passage time: tracker fed with the REAL send time the buffer
+//!   reports at pop (`Departure.send_time_ns`): `send_time_ns - rx_time` (u64
+//!   truncation included) at time rx, in arrival (seq) order, so departures
+//!   that come out of order are held until all earlier ones have departed.
 //!
 //! All hand-derived numbers below follow dpds-core `buffer.rs`/`limiter.rs`
 //! (b825fc6) and were cross-checked with an independent Python re-derivation.
@@ -149,10 +148,6 @@ fn expected_arrivals(config: &Config) -> u64 {
     (duration_ns / iat_ns(config)).floor() as u64 + 1
 }
 
-fn total_drops(r: &SimulationResults) -> u64 {
-    r.dropped_packets_loss + r.dropped_packets_limiter + r.dropped_packets_buffer_full
-}
-
 /// Tolerance for values read back from the 3-significant-digit histograms.
 fn hist_close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() <= 0.0015 * expected.abs() + 1.0
@@ -166,10 +161,8 @@ fn sorted_by_seq(departures: &[Departure]) -> Vec<Departure> {
 
 /// Oracle: aggregated results recomputed from the departure trace.
 fn check_aggregates(config: &Config, r: &SimulationResults, deps: &[Departure]) {
-    let s = &config.simulation_config;
     let n = deps.len();
     assert!(n > 10, "scenario too small to be meaningful");
-    assert_eq!(r.tracked_packets, n);
 
     // delay = tx - rx
     let delay_mean = deps
@@ -183,76 +176,23 @@ fn check_aggregates(config: &Config, r: &SimulationResults, deps: &[Departure]) 
         r.delay_mean_ns
     );
 
-    // inter-departure mean telescopes to (last - first) / (n - 1)
-    let span = deps[n - 1].tx_time_ns - deps[0].tx_time_ns;
-    let inter = span / (n - 1) as f64;
-    assert!(
-        hist_close(r.inter_arrival_time_mean_ns, inter),
-        "inter-departure mean {} vs oracle {inter}",
-        r.inter_arrival_time_mean_ns
-    );
-
-    // passage times
+    // theoretical passage times
     let delay_cfg = config.delay_config.as_ref().expect("delay config");
-    let mut theoretical = PassageTimeTracker::new(delay_cfg.mean_ns, delay_cfg.std_ns);
-    let theoretical_pts: Vec<f64> = sorted_by_seq(deps)
-        .iter()
-        .filter_map(|d| theoretical.check_delay(d.send_time_ns as f64 - d.rx_time_ns, d.rx_time_ns))
-        .collect();
-    assert!(!theoretical_pts.is_empty(), "scenario has no passages");
-    assert_eq!(
-        r.tracked_theoretical_passage_times,
-        theoretical_pts.len(),
-        "theoretical passage count"
-    );
-    let mean = theoretical_pts.iter().sum::<f64>() / theoretical_pts.len() as f64;
+    let mean = passage_time_reference_mean(delay_cfg.mean_ns, delay_cfg.std_ns, deps)
+        .expect("scenario has no passages");
     assert!(hist_close(r.theoretical_passage_time_mean_ns, mean));
+}
 
-    let mut measured = PassageTimeTracker::new(delay_cfg.mean_ns, delay_cfg.std_ns);
-    let measured_pts: Vec<f64> = deps
+/// Reference for `theoretical_passage_time_mean_ns`: a standalone tracker fed
+/// with `send_time_ns - rx_time_ns` at time `rx_time_ns`, in arrival order.
+/// `None` if there is no passage.
+fn passage_time_reference_mean(mean_ns: f64, std_ns: f64, deps: &[Departure]) -> Option<f64> {
+    let mut tracker = PassageTimeTracker::new(mean_ns, std_ns);
+    let pts: Vec<f64> = sorted_by_seq(deps)
         .iter()
-        .filter_map(|d| measured.check_delay(d.tx_time_ns - d.rx_time_ns, d.tx_time_ns))
+        .filter_map(|d| tracker.check_delay(d.send_time_ns as f64 - d.rx_time_ns, d.rx_time_ns))
         .collect();
-    assert_eq!(
-        r.tracked_measured_passage_times,
-        measured_pts.len(),
-        "measured passage count"
-    );
-    if !measured_pts.is_empty() {
-        let mean = measured_pts.iter().sum::<f64>() / measured_pts.len() as f64;
-        assert!(hist_close(r.measured_passage_time_mean_ns, mean));
-    }
-
-    // burst virtual queue: independent Spacer fed with the departure times
-    let mut queue = Limiter::new(
-        LimiterMode::Spacer,
-        true,
-        s.rate_gbps * 1e9 / 0.90,
-        f64::MAX,
-    );
-    let frame = s.average_frame_size_byte.ceil() as u32;
-    let offsets: Vec<f64> = deps
-        .iter()
-        .map(|d| {
-            queue
-                .limiter_calculate_offset_ns(d.tx_time_ns, frame)
-                .expect("limit f64::MAX never drops")
-        })
-        .collect();
-    let max = offsets.iter().cloned().fold(0., f64::max);
-    let mean = offsets.iter().map(|o| o.round()).sum::<f64>() / n as f64;
-    assert_eq!(r.dropped_packets_burst_virtual_queue, 0);
-    assert!(
-        r.burst_spacing_offset_max_ns as f64 >= max.round()
-            && r.burst_spacing_offset_max_ns as f64 <= max * 1.0015 + 2.,
-        "burst max {} vs oracle {max}",
-        r.burst_spacing_offset_max_ns
-    );
-    assert!(
-        hist_close(r.burst_spacing_offset_mean_ns, mean),
-        "burst mean {} vs oracle {mean}",
-        r.burst_spacing_offset_mean_ns
-    );
+    (!pts.is_empty()).then(|| pts.iter().sum::<f64>() / pts.len() as f64)
 }
 
 // -------------------------------------------------------------------- config
@@ -325,31 +265,15 @@ fn simulation_configs_json_still_parses_without_the_new_fields() {
 
 // ----------------------------------------------------------------------- csv
 
-const EXPECTED_HEADER: [&str; 23] = [
+const EXPECTED_HEADER: [&str; 8] = [
     "run",
-    "tracked_packets",
-    "inter_arrival_time_mean_ns",
-    "inter_arrival_time_std_ns",
     "delay_mean_ns",
     "delay_std_ns",
-    "kendall_tau_distance",
     "kendall_tau_distance_div_n",
     "out_of_order_packets",
-    "out_of_order_packets_div_n",
-    "tracked_theoretical_passage_times",
     "theoretical_passage_time_mean_ns",
-    "theoretical_passage_time_std_ns",
-    "tracked_measured_passage_times",
-    "measured_passage_time_mean_ns",
-    "measured_passage_time_std_ns",
-    // `dropped_packets_bandwidth` is replaced in place by the three below
-    "dropped_packets_loss",
     "dropped_packets_limiter",
     "dropped_packets_buffer_full",
-    "burst_spacing_offset_mean_ns",
-    "burst_spacing_offset_std_ns",
-    "burst_spacing_offset_max_ns",
-    "dropped_packets_burst_virtual_queue",
 ];
 
 #[test]
@@ -385,24 +309,30 @@ fn csv_row_of(name: &str, results: &SimulationResults, run: u32) -> (Vec<String>
 #[test]
 fn csv_row_has_one_field_per_header_column_in_header_order() {
     let cfg = scenario()
+        .with("duration_s", json!(0.005))
         .with("loss_model", json!({"Random": 0.3}))
-        .delay("NormalDistribution", 100_000., 30_000.)
-        .capacity(10)
-        .limiter("Spacer", 0.5e9)
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .capacity(200)
+        .reorder(true)
         .build();
     let r = run_simulation(&cfg, 0);
-    // lost packets still consume spacing slots, so the derived limit
-    // (10 x 12336 bit) is reached although the buffer never needs to hold it
-    assert!(r.dropped_packets_loss > 0 && r.dropped_packets_limiter > 0);
+    assert!(r.out_of_order_packets > 0, "scenario must reorder");
     let (header, row) = csv_row_of("row-shape", &r, 3);
     assert_eq!(row.len(), header.len());
     let field =
         |name: &str| -> &String { &row[header.iter().position(|h| h == name).expect(name)] };
     assert_eq!(field("run"), "3");
-    assert_eq!(field("tracked_packets"), &r.tracked_packets.to_string());
     assert_eq!(
-        field("dropped_packets_loss"),
-        &r.dropped_packets_loss.to_string()
+        field("out_of_order_packets"),
+        &r.out_of_order_packets.to_string()
+    );
+    assert_eq!(
+        field("delay_mean_ns").parse::<f64>().unwrap(),
+        r.delay_mean_ns
+    );
+    assert_eq!(
+        field("delay_std_ns").parse::<f64>().unwrap(),
+        r.delay_std_ns
     );
     assert_eq!(
         field("dropped_packets_limiter"),
@@ -412,14 +342,7 @@ fn csv_row_has_one_field_per_header_column_in_header_order() {
         field("dropped_packets_buffer_full"),
         &r.dropped_packets_buffer_full.to_string()
     );
-    assert_eq!(
-        field("burst_spacing_offset_max_ns"),
-        &r.burst_spacing_offset_max_ns.to_string()
-    );
-    assert_eq!(
-        field("delay_mean_ns").parse::<f64>().unwrap(),
-        r.delay_mean_ns
-    );
+    assert_eq!(header.last().unwrap(), "dropped_packets_buffer_full");
 }
 
 #[test]
@@ -449,7 +372,7 @@ fn binary_rows_equal_library_runs_with_seed_plus_run_index() {
 // ------------------------------------------------- smoke over the real sweep
 
 #[test]
-fn smoke_run_of_a_sample_of_simulation_configs_conserves_packets() {
+fn smoke_run_of_a_sample_of_simulation_configs_departs_packets() {
     let text = include_str!("../simulation_configs.json");
     let configs: Vec<Config> = serde_json::from_str(text).unwrap();
     let mut seen = HashSet::new();
@@ -468,14 +391,14 @@ fn smoke_run_of_a_sample_of_simulation_configs_conserves_packets() {
         }
         c.simulation_config.duration_s = 0.0005;
         c.simulation_config.runs = 1;
-        let r = run_simulation(&c, 0);
+        let (r, deps) = trace(&c, 0);
         let arrivals = expected_arrivals(&c);
-        let accounted = r.tracked_packets as u64 + total_drops(&r);
         assert!(
-            accounted.abs_diff(arrivals) <= 1,
-            "{key}: {accounted} accounted vs {arrivals} arrivals"
+            !deps.is_empty() && deps.len() as u64 <= arrivals,
+            "{key}: {} departures vs {arrivals} arrivals",
+            deps.len()
         );
-        assert!(r.tracked_packets > 0 || total_drops(&r) > 0, "{key}");
+        assert!(r.delay_mean_ns.is_finite(), "{key}");
     }
     assert!(seen.len() >= 9, "sample too small: {}", seen.len());
 }
@@ -496,16 +419,9 @@ fn constant_delay_departs_at_exact_send_times(reordering: bool) {
         assert_eq!(d.send_time_ns, 1_000_000 + 10_000 * k as u64, "truncated");
         assert_eq!(d.tx_time_ns, d.send_time_ns as f64, "pop at the send time");
     }
-    assert_eq!(r.tracked_packets, 101);
     assert!(hist_close(r.delay_mean_ns, 1_000_000.));
     assert!(r.delay_std_ns < 1.0, "every delay identical");
-    assert!(hist_close(r.inter_arrival_time_mean_ns, IAT));
-    assert!(
-        r.inter_arrival_time_std_ns < 1.0,
-        "inter-departure = inter-arrival"
-    );
     assert_eq!(r.out_of_order_packets, 0);
-    assert_eq!(total_drops(&r), 0);
 }
 
 #[test]
@@ -551,9 +467,8 @@ fn default_buffer_capacity_does_not_bind() {
         .with("duration_s", json!(0.01))
         .delay("DeterministicDistribution", 100_000_000., 0.)
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert_eq!(deps.len() as u64, expected_arrivals(&cfg));
-    assert_eq!(total_drops(&r), 0);
 }
 
 #[test]
@@ -580,14 +495,9 @@ fn default_capacity_binds_exactly_at_two_to_the_twenty_one_packets_in_flight() {
             .build();
         let arrivals = expected_arrivals(&cfg);
         assert!(arrivals > (1 << 21) + 50_000, "{arrivals} arrivals");
-        let r = run_simulation(&cfg, 0);
-        assert_eq!(r.tracked_packets as u64, 1 << 21, "reordering={reordering}");
-        assert_eq!(
-            r.dropped_packets_buffer_full,
-            arrivals - (1 << 21),
-            "reordering={reordering}"
-        );
-        assert_eq!(r.dropped_packets_loss + r.dropped_packets_limiter, 0);
+        let mut departures = 0u64;
+        run_simulation_traced(&cfg, 0, |_| departures += 1);
+        assert_eq!(departures, 1 << 21, "reordering={reordering}");
     }
 }
 
@@ -597,9 +507,48 @@ fn an_explicit_capacity_overrides_the_default() {
         .with("buffer_capacity", json!(2))
         .delay("DeterministicDistribution", 1_000_000_000., 0.)
         .build();
-    let r = run_simulation(&cfg, 0);
-    assert_eq!(r.tracked_packets, 2);
-    assert_eq!(r.dropped_packets_buffer_full, expected_arrivals(&cfg) - 2);
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 2);
+}
+
+// ------------------------------------------------- buffer-full drops counted
+
+/// Capacity 5, delay 1 ms (100 inter-arrival times), no loss, no limiter; 301
+/// arrivals, 5 accepted per 100 and the last one (index 300) too = 16:
+/// every arrival is either accepted (it departs) or rejected as buffer-full.
+#[test]
+fn buffer_full_drops_are_counted_and_reach_the_csv() {
+    for reordering in [false, true] {
+        let cfg = scenario()
+            .with("duration_s", json!(0.003))
+            .capacity(5)
+            .delay("DeterministicDistribution", 1_000_000., 0.)
+            .reorder(reordering)
+            .build();
+        let (r, deps) = trace(&cfg, 0);
+        let expected = expected_arrivals(&cfg) - deps.len() as u64;
+        assert_eq!(deps.len(), 16, "reordering={reordering}");
+        assert!(expected > 0, "scenario must overflow the buffer");
+        assert_eq!(
+            r.dropped_packets_buffer_full, expected,
+            "reordering={reordering}"
+        );
+        assert_eq!(r.dropped_packets_limiter, 0);
+        let (header, row) = csv_row_of("buffer-full", &r, 0);
+        let column = header
+            .iter()
+            .position(|h| h == "dropped_packets_buffer_full")
+            .expect("column");
+        assert_eq!(row[column], expected.to_string());
+    }
+}
+
+#[test]
+fn no_buffer_full_drops_with_a_large_buffer() {
+    let cfg = scenario()
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .build();
+    assert_eq!(run_simulation(&cfg, 0).dropped_packets_buffer_full, 0);
 }
 
 // ----------------------------------------------------- random delay: ordering
@@ -635,7 +584,6 @@ fn fifo_with_random_delay_departs_in_sequence_order_with_head_of_line_blocking()
         "std 300 us >> iat 10 us must block heads of line"
     );
     assert_eq!(r.out_of_order_packets, 0);
-    assert_eq!(total_drops(&r), 0);
     check_aggregates(&cfg, &r, &deps);
 }
 
@@ -679,7 +627,6 @@ fn reordering_with_random_delay_departs_in_send_time_order() {
     }
     assert!(out_of_order > 0, "std 300 us >> iat 10 us must reorder");
     assert_eq!(r.out_of_order_packets, out_of_order);
-    assert!((r.out_of_order_packets_div_n - out_of_order as f64 / 501.).abs() < 1e-12);
     check_aggregates(&cfg, &r, &deps);
 }
 
@@ -701,11 +648,20 @@ fn reordering_results_can_use_the_kendall_tau_metric() {
         }
     }
     assert!(inversions > 0);
-    assert_eq!(r.kendall_tau_distance, inversions);
+    assert_kendall_div_n(&r, inversions, deps.len());
     assert_eq!(r.out_of_order_packets, 0);
 }
 
 // ------------------------------------------- Kendall tau with dropped packets
+
+/// `kendall_tau_distance_div_n` = inversions per departed packet.
+fn assert_kendall_div_n(r: &SimulationResults, inversions: usize, departed: usize) {
+    assert!(
+        (r.kendall_tau_distance_div_n - inversions as f64 / departed as f64).abs() < 1e-12,
+        "div_n {} vs {inversions}/{departed}",
+        r.kendall_tau_distance_div_n
+    );
+}
 
 /// Oracle: inversions among the packets that actually departed, from the
 /// departure trace (pairs transmitted in the opposite order of their arrival).
@@ -729,7 +685,6 @@ fn kendall(scenario: Scenario) -> Scenario {
 fn assert_kendall_counts_only_survivors(cfg: &Config, expect_reordering: bool) {
     let (r, deps) = trace(cfg, 0);
     let arrivals = expected_arrivals(cfg);
-    assert!(total_drops(&r) > 0, "scenario must drop packets");
     assert!(
         (deps.len() as u64) < arrivals
             && deps.iter().map(|d| d.seq).max().unwrap() >= deps.len() as u64,
@@ -741,13 +696,7 @@ fn assert_kendall_counts_only_survivors(cfg: &Config, expect_reordering: bool) {
     } else {
         assert_eq!(inversions, 0);
     }
-    assert_eq!(r.kendall_tau_distance, inversions);
-    assert!(
-        (r.kendall_tau_distance_div_n - inversions as f64 / deps.len() as f64).abs() < 1e-12,
-        "div_n {} vs {inversions}/{}",
-        r.kendall_tau_distance_div_n,
-        deps.len()
-    );
+    assert_kendall_div_n(&r, inversions, deps.len());
     assert_eq!(r.out_of_order_packets, 0, "the other metric stays unused");
 }
 
@@ -792,16 +741,14 @@ fn kendall_tau_with_a_tiny_capacity_equals_the_inversions_of_the_survivors() {
             .reorder(true),
     )
     .build();
-    let (r, _) = trace(&cfg, 0);
-    assert!(r.dropped_packets_buffer_full > 0);
     assert_kendall_counts_only_survivors(&cfg, true);
 }
 
 #[test]
-fn kendall_tau_with_limiter_drops_is_zero_because_the_survivors_stay_in_order() {
-    // Spacer at 0.5 Gbit/s under 1.2 Gbit/s offered load, with delay jitter.
-    // Lost packets consume spacing slots, so the derived limit (100 x 12336
-    // bit) is reached and the limiter drops as well.
+fn kendall_tau_with_reordering_and_a_spacer_equals_the_inversions_of_the_survivors() {
+    // The Spacer sits behind the reorder heap and keeps the heap order, so the
+    // jitter-induced inversions survive it; loss and a small capacity drop
+    // packets on top.
     let cfg = kendall(
         scenario()
             .with("duration_s", json!(0.005))
@@ -812,30 +759,7 @@ fn kendall_tau_with_limiter_drops_is_zero_because_the_survivors_stay_in_order() 
             .reorder(true),
     )
     .build();
-    let (r, _) = trace(&cfg, 0);
-    assert!(r.dropped_packets_limiter > 0);
-    // the Spacer serialises its (already delayed) packets: survivors stay in
-    // order, so the distance must be 0 however many packets it drops
-    assert_kendall_counts_only_survivors(&cfg, false);
-}
-
-#[test]
-fn kendall_tau_with_all_three_drop_causes_equals_the_survivor_inversions_zero() {
-    let cfg = kendall(
-        scenario()
-            .with("duration_s", json!(0.01))
-            .with("loss_model", json!({"Random": 0.2}))
-            .with("buffer_capacity", json!(40))
-            .delay("NormalDistribution", 400_000., 200_000.)
-            .limiter("Spacer", 0.9e9)
-            .reorder(true),
-    )
-    .build();
-    let (r, _) = trace(&cfg, 0);
-    assert!(r.dropped_packets_loss > 0);
-    assert!(r.dropped_packets_limiter + r.dropped_packets_buffer_full > 0);
-    // (the Spacer keeps the survivors in order, see the limiter test above)
-    assert_kendall_counts_only_survivors(&cfg, false);
+    assert_kendall_counts_only_survivors(&cfg, true);
 }
 
 #[test]
@@ -850,12 +774,14 @@ fn kendall_tau_without_reordering_is_zero_even_when_packets_are_dropped() {
         )
         .build();
         let (r, deps) = trace(&cfg, 0);
-        assert!(r.dropped_packets_loss > 0, "loss {loss}");
+        assert!(
+            (deps.len() as u64) < expected_arrivals(&cfg),
+            "loss {loss}: packets must be dropped"
+        );
         assert!(
             deps.windows(2).all(|w| w[0].seq < w[1].seq),
             "FIFO order of the survivors"
         );
-        assert_eq!(r.kendall_tau_distance, 0, "loss {loss}");
         assert_eq!(r.kendall_tau_distance_div_n, 0.0, "loss {loss}");
     }
 }
@@ -869,9 +795,9 @@ fn kendall_tau_without_survivors_is_zero() {
             .reorder(true),
     )
     .build();
-    let r = run_simulation(&cfg, 0);
-    assert_eq!(r.tracked_packets, 0);
-    assert_eq!(r.kendall_tau_distance, 0);
+    let (r, deps) = trace(&cfg, 0);
+    assert!(deps.is_empty());
+    assert_eq!(r.kendall_tau_distance_div_n, 0.0);
 }
 
 #[test]
@@ -890,11 +816,7 @@ fn kendall_tau_is_independent_of_which_packets_were_dropped() {
         )
         .build();
         let (r, deps) = trace(&cfg, 0);
-        assert_eq!(
-            r.kendall_tau_distance,
-            survivor_inversions(&deps),
-            "seed {seed}"
-        );
+        assert_kendall_div_n(&r, survivor_inversions(&deps), deps.len());
     }
 }
 
@@ -920,7 +842,7 @@ fn out_of_order_counter_with_drops_still_matches_the_trace() {
     }
     assert!(out_of_order > 0);
     assert_eq!(r.out_of_order_packets, out_of_order);
-    assert_eq!(r.kendall_tau_distance, 0);
+    assert_eq!(r.kendall_tau_distance_div_n, 0.0);
 }
 
 // ------------------------------------------------------------------ limiters
@@ -960,13 +882,9 @@ fn buffer_full_packets_do_not_advance_the_spacer() {
         .delay("DeterministicDistribution", 300_000., 0.)
         .limiter("Spacer", 0.5e9)
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert_eq!(expected_arrivals(&cfg), 301);
     assert_eq!(deps.len(), 133);
-    assert_eq!(r.tracked_packets, 133);
-    assert_eq!(r.dropped_packets_buffer_full, 168);
-    assert_eq!(r.dropped_packets_limiter, 0);
-    assert_eq!(r.dropped_packets_loss, 0);
     for (j, d) in deps.iter().enumerate() {
         assert_eq!(
             d.send_time_ns,
@@ -1000,7 +918,7 @@ fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
         .delay("DeterministicDistribution", 1_000_000., 0.)
         .limiter("Spacer", 0.5e9)
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     let first_14: Vec<(u64, u64)> = deps
         .iter()
         .take(14)
@@ -1026,35 +944,6 @@ fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
         ]
     );
     assert_eq!(deps.len(), 14);
-    assert_eq!(r.dropped_packets_buffer_full, 87);
-    assert_eq!(r.dropped_packets_limiter, 0);
-    assert_eq!(r.dropped_packets_loss, 0);
-}
-
-/// Lost packets are accounted by the limiter (they consume spacing slots),
-/// buffer-full ones are not. Zero delay, Spacer at 0.5 bit/ns, capacity 2
-/// (limit 24672 bit = 2.05 packets): without loss the queue is the only thing
-/// that fills the Spacer, with 50 % loss the lost packets fill it as well and
-/// the limiter starts to reject packets that the buffer alone would have
-/// accepted.
-#[test]
-fn lost_packets_consume_spacing_slots_until_the_derived_limit_is_reached() {
-    for seed in 1..=5u64 {
-        let base = scenario().capacity(2).limiter("Spacer", 0.5e9);
-        let with_loss = base
-            .clone()
-            .with("seed", json!(seed))
-            .with("loss_model", json!({"Random": 0.5}))
-            .build();
-        let r = run_simulation(&with_loss, 0);
-        assert!(r.dropped_packets_loss > 0, "seed {seed}");
-        assert!(r.dropped_packets_limiter > 0, "seed {seed}");
-        assert_eq!(
-            total_drops(&r) + r.tracked_packets as u64,
-            101,
-            "seed {seed}"
-        );
-    }
 }
 
 /// Boundary of the derived limit of the SPACER. Rate 1e6 bit/s (drains
@@ -1081,9 +970,10 @@ fn spacer_limit_is_the_derived_capacity_times_12336_bit() {
         .build();
     let (r, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 21);
-    assert_eq!(r.dropped_packets_loss, 50);
-    assert_eq!(r.dropped_packets_limiter, 30);
-    assert_eq!(r.dropped_packets_buffer_full, 0);
+    assert_eq!(
+        r.dropped_packets_limiter, 30,
+        "lost packets are not counted"
+    );
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
     assert_eq!(seqs, (0..=40).step_by(2).collect::<Vec<u64>>());
 }
@@ -1094,23 +984,20 @@ fn spacer_below_offered_load_without_limit_pressure_departs_every_24064_ns() {
         .delay("DeterministicDistribution", 1_000_000., 0.)
         .limiter("Spacer", 0.5e9)
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 101);
-    assert_eq!(total_drops(&r), 0);
     for (k, d) in deps.iter().enumerate() {
         assert_eq!(d.send_time_ns, 1_000_000 + 24_064 * k as u64);
         assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
     }
-    assert!(hist_close(r.inter_arrival_time_mean_ns, 24_064.));
 }
 
 #[test]
 fn spacer_above_offered_load_neither_delays_nor_drops() {
     // 2 bit/ns: service 6016 ns < iat 10000 ns, the fill state is always empty.
     let cfg = scenario().limiter("Spacer", 2e9).build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 101);
-    assert_eq!(total_drops(&r), 0);
     for d in &deps {
         assert_eq!(d.tx_time_ns, d.rx_time_ns, "no delay config: zero delay");
     }
@@ -1151,8 +1038,6 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
     assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 12, 15, 17, 20, 22]);
     assert_eq!(deps.len(), 44);
     assert_eq!(r.dropped_packets_limiter, 57);
-    assert_eq!(r.dropped_packets_loss, 0);
-    assert_eq!(r.dropped_packets_buffer_full, 0);
     for d in &deps {
         assert_eq!(d.tx_time_ns, d.rx_time_ns, "TBF admits without delay");
     }
@@ -1181,7 +1066,6 @@ fn token_bucket_depth_is_the_derived_capacity_times_12336_bit() {
             101 - admitted as u64,
             "capacity {capacity}"
         );
-        assert_eq!(r.dropped_packets_buffer_full + r.dropped_packets_loss, 0);
     }
 }
 
@@ -1208,9 +1092,8 @@ fn buffer_full_packets_do_not_consume_token_bucket_tokens() {
         seqs,
         vec![0, 1, 2, 100, 101, 102, 200, 201, 202, 300, 301, 302]
     );
-    assert_eq!(r.dropped_packets_buffer_full, 339);
     assert_eq!(r.dropped_packets_limiter, 0);
-    assert_eq!(r.dropped_packets_loss, 0);
+    assert_eq!(r.dropped_packets_buffer_full, 351 - 12);
 }
 
 // ---------------------------------------------------------- capacity and ties
@@ -1225,12 +1108,8 @@ fn equal_time_transmit_before_arrival(reordering: bool) {
         .delay("DeterministicDistribution", IAT, 0.)
         .reorder(reordering)
         .build();
-    let (r, deps) = trace(&cfg, 0);
-    assert_eq!(
-        r.dropped_packets_buffer_full, 0,
-        "transmit must precede arrival"
-    );
-    assert_eq!(deps.len(), 101);
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 101, "transmit must precede arrival: no drops");
     for (k, d) in deps.iter().enumerate() {
         assert_eq!(d.seq, k as u64);
         assert_eq!(d.send_time_ns, 10_000 * (k as u64 + 1));
@@ -1258,34 +1137,28 @@ fn capacity_causes_buffer_full_drops(reordering: bool) {
         .delay("DeterministicDistribution", 100_000.5, 0.)
         .reorder(reordering)
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     let expected: Vec<u64> = (0..=100).filter(|k| k % 10 < 3).collect();
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
     assert_eq!(seqs, expected);
     assert_eq!(deps.len(), 31);
-    assert_eq!(r.dropped_packets_buffer_full, 70);
-    assert_eq!(r.dropped_packets_loss, 0);
-    assert_eq!(r.dropped_packets_limiter, 0);
 }
 
 #[test]
-fn capacity_drops_are_counted_as_buffer_full_in_fifo_mode() {
+fn capacity_drops_arrivals_in_fifo_mode() {
     capacity_causes_buffer_full_drops(false);
 }
 
 #[test]
-fn capacity_drops_are_counted_as_buffer_full_in_reordering_mode() {
+fn capacity_drops_arrivals_in_reordering_mode() {
     capacity_causes_buffer_full_drops(true);
 }
 
 #[test]
 fn zero_capacity_rejects_every_packet_as_buffer_full() {
     let cfg = scenario().with("buffer_capacity", json!(0)).build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert!(deps.is_empty());
-    assert_eq!(r.tracked_packets, 0);
-    assert_eq!(r.dropped_packets_buffer_full, 101);
-    assert_eq!(r.dropped_packets_loss + r.dropped_packets_limiter, 0);
 }
 
 // ----------------------------------------------------------------------- loss
@@ -1297,10 +1170,7 @@ fn random_loss_one_loses_every_packet() {
         .build();
     let (r, deps) = trace(&cfg, 0);
     assert!(deps.is_empty());
-    assert_eq!(r.tracked_packets, 0);
-    assert_eq!(r.dropped_packets_loss, 101);
-    assert_eq!(r.dropped_packets_limiter + r.dropped_packets_buffer_full, 0);
-    assert!(r.delay_mean_ns.is_finite() && r.inter_arrival_time_mean_ns.is_finite());
+    assert!(r.delay_mean_ns.is_finite() && r.theoretical_passage_time_mean_ns.is_finite());
 }
 
 #[test]
@@ -1311,9 +1181,8 @@ fn random_loss_zero_and_default_lose_nothing() {
             .with("loss_model", json!({"Random": 0.0}))
             .build(),
     ] {
-        let (r, deps) = trace(&cfg, 0);
+        let (_, deps) = trace(&cfg, 0);
         assert_eq!(deps.len(), 101);
-        assert_eq!(total_drops(&r), 0);
     }
 }
 
@@ -1324,16 +1193,11 @@ fn random_loss_probability_is_respected_statistically() {
         .with("duration_s", json!(0.2))
         .with("loss_model", json!({"Random": 0.3}))
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     let arrivals = expected_arrivals(&cfg);
     assert_eq!(arrivals, 20_001);
-    assert_eq!(r.dropped_packets_loss + deps.len() as u64, arrivals);
-    assert!(
-        r.dropped_packets_loss.abs_diff(6_000) <= 400,
-        "lost {}",
-        r.dropped_packets_loss
-    );
-    assert_eq!(r.dropped_packets_limiter + r.dropped_packets_buffer_full, 0);
+    let lost = arrivals - deps.len() as u64;
+    assert!(lost.abs_diff(6_000) <= 400, "lost {lost}");
     for pair in deps.windows(2) {
         assert!(pair[0].seq < pair[1].seq, "FIFO order with gaps");
     }
@@ -1349,96 +1213,187 @@ fn gilbert_elliot_loss_model_is_applied() {
             json!({"GilbertElliot": [1.0, 0.0, 1.0, 0.0, true]}),
         )
         .build();
-    let (r, deps) = trace(&cfg, 0);
+    let (_, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 1);
     assert_eq!(deps[0].seq, 0);
-    assert_eq!(r.dropped_packets_loss, 100);
 }
 
-/// TBF at 0.5 bit/ns with capacity 1 (bucket 12336 bit, starts full), zero
-/// delay: the bucket gains 5000 bit per arrival and a packet costs 12032 bit,
-/// so every third arrival (k % 3 == 0: 34 of 101) is admitted and the other 67
-/// are rejected by the limiter.
-fn tight_token_bucket() -> Scenario {
-    scenario().capacity(1).limiter("TokenBucketFilter", 0.5e9)
-}
-
-#[test]
-fn loss_takes_precedence_over_limiter_drop_in_the_counters() {
-    // The limiter would reject 67 of the packets, the loss model rejects
-    // every packet: dpds-core reports Lost.
-    let cfg = tight_token_bucket()
-        .with("loss_model", json!({"Random": 1.0}))
-        .build();
-    let r = run_simulation(&cfg, 0);
-    assert_eq!(r.dropped_packets_loss, 101);
-    assert_eq!(r.dropped_packets_limiter, 0);
-    // without loss the same limiter drops those 67
-    let (r, deps) = trace(&tight_token_bucket().build(), 0);
-    assert_eq!(r.dropped_packets_limiter, 67);
-    assert_eq!(r.dropped_packets_loss, 0);
-    assert_eq!(r.dropped_packets_buffer_full, 0);
-    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
-    assert_eq!(seqs, (0..=99).step_by(3).collect::<Vec<u64>>());
-}
-
-#[test]
-fn buffer_full_takes_precedence_over_loss_and_limiter_in_the_counters() {
-    // Capacity 0: the buffer rejects everything before the loss model (which
-    // would also reject everything) or the limiter (derived limit 0 bit,
-    // would reject everything) is consulted.
-    for limiter in ["Spacer", "TokenBucketFilter"] {
-        let cfg = scenario()
-            .capacity(0)
-            .with("loss_model", json!({"Random": 1.0}))
-            .limiter(limiter, 0.5e9)
-            .build();
-        let (r, deps) = trace(&cfg, 0);
-        assert!(deps.is_empty(), "{limiter}");
-        assert_eq!(r.dropped_packets_buffer_full, 101, "{limiter}");
-        assert_eq!(r.dropped_packets_loss, 0, "{limiter}");
-        assert_eq!(r.dropped_packets_limiter, 0, "{limiter}");
-    }
-}
-
-/// Capacity 1, delay 1 ms, Gilbert-Elliot with p = 1, k = 1, h = 0 (first
-/// packet survives, every later one is lost). Arrival 0 is accepted and
-/// fills the buffer; 1..99 are rejected as buffer-full and must not consume a
-/// loss draw (the model would move on to its lossy state); at arrival 100
-/// (packet 0 leaves first, tie rule) the model is therefore still at its
-/// second draw and loses it. 99 buffer-full, 1 lost, 1 accepted. (With the old
-/// order the model had already been advanced by arrival 1: 100 lost, 0 full.)
+/// Capacity 1, delay 1 ms, Gilbert-Elliot with p = r = 1, k = 1, h = 0 (every
+/// second loss draw is lost, starting with the second). Arrival 0 draws first
+/// (survives) and fills the buffer; 1..99 are rejected as buffer-full and must
+/// not consume a loss draw; at arrival 100 (packet 0 leaves first, tie rule)
+/// the model is at its second draw and loses it, arrival 101 draws a survivor
+/// and is accepted. Departures: 0 and 101. (Were the draw consumed by every
+/// arrival, arrival 100 would be an even draw and survive: 0 and 100.)
 #[test]
 fn buffer_full_packets_consume_no_loss_draw() {
     let cfg = scenario()
+        .with("duration_s", json!(0.0012))
         .capacity(1)
         .delay("DeterministicDistribution", 1_000_000., 0.)
         .with(
             "loss_model",
-            json!({"GilbertElliot": [1.0, 0.0, 1.0, 0.0, true]}),
+            json!({"GilbertElliot": [1.0, 1.0, 1.0, 0.0, true]}),
         )
         .build();
-    let (r, deps) = trace(&cfg, 0);
-    assert_eq!(deps.len(), 1);
-    assert_eq!(deps[0].seq, 0);
-    assert_eq!(r.dropped_packets_buffer_full, 99);
-    assert_eq!(r.dropped_packets_loss, 1);
-    assert_eq!(r.dropped_packets_limiter, 0);
+    let (_, deps) = trace(&cfg, 0);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, vec![0, 101]);
+}
+
+// ----------------------------------------------- reordering with a Spacer
+
+/// Reordering (heap) + active Spacer: 501 packets, delay 1 ms +- 300 us
+/// (heavy reordering), Spacer at 0.5 Gbit/s (24064 ns per packet against 10000
+/// ns inter-arrival time, so a backlog builds and spacing is substantial).
+fn spaced_reordering(spacer: bool) -> Config {
+    let s = scenario()
+        .with("duration_s", json!(0.005))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .reorder(true);
+    if spacer {
+        s.limiter("Spacer", 0.5e9).build()
+    } else {
+        s.build()
+    }
 }
 
 #[test]
-fn drop_causes_are_conserved_with_all_three_active() {
-    let cfg = scenario()
-        .with("duration_s", json!(0.01))
-        .with("loss_model", json!({"Random": 0.2}))
-        .with("buffer_capacity", json!(10))
-        .delay("NormalDistribution", 100_000., 30_000.)
-        .limiter("Spacer", 0.9e9)
-        .build();
-    let (r, deps) = trace(&cfg, 0);
-    assert_eq!(deps.len() as u64 + total_drops(&r), expected_arrivals(&cfg));
-    assert!(r.dropped_packets_loss > 0);
-    assert!(r.dropped_packets_limiter + r.dropped_packets_buffer_full > 0);
+fn reordering_with_a_spacer_pops_exactly_when_packets_really_leave() {
+    let (r, deps) = trace(&spaced_reordering(true), 0);
+    assert_eq!(
+        deps.len(),
+        501,
+        "the Spacer has no limit: nothing is dropped"
+    );
+    for d in &deps {
+        // spacing never delays an arrival
+        assert_eq!(d.rx_time_ns, d.seq as f64 * IAT, "seq {}", d.seq);
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64, "seq {}", d.seq);
+    }
+    assert!(
+        deps.windows(2).all(|w| w[0].tx_time_ns <= w[1].tx_time_ns),
+        "tx times never go back"
+    );
+    assert!(
+        r.out_of_order_packets > 0,
+        "std 300 us >> iat 10 us must reorder"
+    );
+    assert_eq!(r.dropped_packets_limiter, 0, "the Spacer has no limit");
+}
+
+#[test]
+fn reordering_with_a_spacer_spaces_the_reordered_departures_of_the_same_run_without_it() {
+    let (_, reordered) = trace(&spaced_reordering(false), 0);
+    let (_, spaced) = trace(&spaced_reordering(true), 0);
+    assert_eq!(reordered.len(), 501);
+
+    // Reference: the heap times (= send times without a limiter) in departure
+    // order through a standalone Spacer, with the FEC bytes the buffer adds.
+    let frame = scenario()
+        .build()
+        .simulation_config
+        .average_frame_size_byte
+        .ceil() as u32
+        + 4;
+    let mut spacer = Limiter::new(LimiterMode::Spacer, true, 0.5e9, f64::MAX);
+    let expected: Vec<f64> = reordered
+        .iter()
+        .map(|d| {
+            let heap_time_ns = d.send_time_ns as f64;
+            let offset_ns = spacer
+                .limiter_calculate_offset_ns(heap_time_ns, frame)
+                .expect("limit f64::MAX never drops");
+            (heap_time_ns + offset_ns) as u64 as f64
+        })
+        .collect();
+    let tx: Vec<f64> = spaced.iter().map(|d| d.tx_time_ns).collect();
+    assert_eq!(tx, expected);
+    assert!(
+        reordered
+            .iter()
+            .zip(&expected)
+            .any(|(d, e)| d.tx_time_ns != *e),
+        "the Spacer must actually space something"
+    );
+
+    let packets = |deps: &[Departure]| -> HashSet<(u64, u64)> {
+        deps.iter()
+            .map(|d| (d.seq, d.rx_time_ns.to_bits()))
+            .collect()
+    };
+    assert_eq!(packets(&spaced), packets(&reordered));
+}
+
+/// Delay config of the passage-time tests: mean 1 ms +- 300 us (thresholds
+/// 700 us / 1.3 ms), optionally with the correlated delayer.
+fn passage_scenario(correlated: bool) -> Scenario {
+    let mut s = scenario()
+        .with("duration_s", json!(0.02)) // 2001 packets
+        .delay("NormalDistribution", 1_000_000., 300_000.);
+    if correlated {
+        let delay = s.delay.as_mut().unwrap();
+        delay["activate_correlation"] = json!(true);
+        delay["half_life_period_ns"] = json!(200_000.);
+    }
+    s
+}
+
+/// FIFO: the send time at pop equals the send time reported at push, so the
+/// passage times are those of the `send_time - rx` series in arrival order,
+/// with and without the correlated delayer and Spacer. (A Spacer on
+/// uncorrelated delays makes the send times monotone: no passages at all.)
+#[test]
+fn fifo_passage_time_is_that_of_the_send_times_in_arrival_order() {
+    for (correlated, spacer) in [(false, false), (true, false), (true, true)] {
+        let s = passage_scenario(correlated).with("loss_model", json!({"Random": 0.1}));
+        let cfg = if spacer {
+            s.limiter("Spacer", 10e9).build()
+        } else {
+            s.build()
+        };
+        let (r, deps) = trace(&cfg, 0);
+        let d = cfg.delay_config.as_ref().unwrap();
+        let expected = passage_time_reference_mean(d.mean_ns, d.std_ns, &deps)
+            .unwrap_or_else(|| panic!("no passages (correlated={correlated} spacer={spacer})"));
+        assert!(
+            hist_close(r.theoretical_passage_time_mean_ns, expected),
+            "correlated={correlated} spacer={spacer}: {} vs {expected}",
+            r.theoretical_passage_time_mean_ns
+        );
+    }
+}
+
+/// Reordering + Spacer: the tracker gets the spaced send time at pop, not the
+/// heap time of the push. Spacer at 1.5 Gbit/s (8021 ns per packet against an
+/// inter-arrival time of 10000 ns): only the bunched heap times are spaced.
+#[test]
+fn reordering_with_a_spacer_passage_time_uses_the_spaced_send_times() {
+    let build = |spacer: bool| {
+        let s = passage_scenario(false).reorder(true);
+        if spacer {
+            s.limiter("Spacer", 1.5e9).build()
+        } else {
+            s.build()
+        }
+    };
+    let (r, spaced) = trace(&build(true), 0);
+    let (_, heap) = trace(&build(false), 0);
+    let delay = build(true).delay_config.unwrap();
+    let from_spaced = passage_time_reference_mean(delay.mean_ns, delay.std_ns, &spaced)
+        .expect("passages with spacing");
+    let from_heap = passage_time_reference_mean(delay.mean_ns, delay.std_ns, &heap)
+        .expect("passages at heap times");
+
+    assert!(
+        !hist_close(from_spaced, from_heap),
+        "spacing must move the passage time: spaced {from_spaced}, heap {from_heap}"
+    );
+    assert!(
+        hist_close(r.theoretical_passage_time_mean_ns, from_spaced),
+        "{} vs spaced reference {from_spaced} (heap-time version: {from_heap})",
+        r.theoretical_passage_time_mean_ns
+    );
 }
 
 // ----------------------------------------------------------------------- seed
@@ -1485,9 +1440,6 @@ fn run_r_with_seed_s_equals_run_zero_with_seed_s_plus_r() {
 fn unseeded_runs_complete() {
     let mut cfg = noisy().build();
     cfg.simulation_config.seed = None;
-    let r = run_simulation(&cfg, 0);
-    assert_eq!(
-        r.tracked_packets as u64 + total_drops(&r),
-        expected_arrivals(&cfg)
-    );
+    let (_, deps) = trace(&cfg, 0);
+    assert!(!deps.is_empty() && deps.len() as u64 <= expected_arrivals(&cfg));
 }

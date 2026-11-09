@@ -23,7 +23,12 @@
 //!   the packet departs (or was not accepted), so the table is as large as the
 //!   most packets ever in flight. The arrival time is recomputed from the
 //!   arrival index.
+//! * The passage-time tracker gets `send time - arrival time` of each packet
+//!   at the arrival time, at departure but in accepted-ordinal order: a packet
+//!   that departs early waits in a pending map until all earlier accepted
+//!   packets have departed (bounded by the reordering depth).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use dpds_core::{
@@ -31,7 +36,7 @@ use dpds_core::{
     buffer::{Buffer, PushOutcome},
     delayer::RVDistribution,
     dropper::LossModel,
-    limiter::{Limiter, LimiterMode},
+    limiter::LimiterMode,
 };
 
 use crate::config::{Config, SimulationConfig};
@@ -49,7 +54,9 @@ pub struct Departure {
     pub seq: u64,
     /// Arrival time (the `now` passed to `push_outcome`).
     pub rx_time_ns: f64,
-    /// Send time the buffer promised (`Accepted { send_time_ns }`).
+    /// Send time `pop_due_with_time` reported (whole ns). Equals
+    /// `Accepted { send_time_ns }` except with reordering + Spacer, where that
+    /// is the heap time before spacing.
     pub send_time_ns: u64,
     /// Simulation time of the transmit event.
     pub tx_time_ns: f64,
@@ -81,15 +88,6 @@ pub fn run_simulation_traced<F: FnMut(&Departure)>(
     let inter_arrival_time_ns = inter_arrival_time_ns(sim);
     let duration_ns = duration_ns(sim);
 
-    // Virtual queue at X% utilization: the burst spacing a link running at
-    // rate / X would need for the departure stream.
-    let mut burst_virtual_queue = Limiter::new(
-        LimiterMode::Spacer,
-        true,
-        sim.rate_gbps * 1e9 / 0.90,
-        f64::MAX,
-    );
-
     let mut next_seq: u64 = 0;
     // Number of accepted packets so far: the dense ordinal of the next one.
     let mut accepted: u64 = 0;
@@ -98,7 +96,10 @@ pub fn run_simulation_traced<F: FnMut(&Departure)>(
     let mut slots: Vec<(u64, u64)> = Vec::new();
     let mut free_slots: Vec<usize> = Vec::new();
     let mut clock_ns = 0.;
-    let mut last_departure_ns: Option<f64> = None;
+    // Passage-time samples of packets that departed before an earlier accepted
+    // one: ordinal -> (send time - arrival time, arrival time).
+    let mut pending_passage: HashMap<u64, (f64, f64)> = HashMap::new();
+    let mut next_passage_ordinal: u64 = 0;
 
     loop {
         let next_arrival_ns = next_seq as f64 * inter_arrival_time_ns;
@@ -118,18 +119,16 @@ pub fn run_simulation_traced<F: FnMut(&Departure)>(
                 free_slots.push(slot);
                 let rx_time_ns = seq as f64 * inter_arrival_time_ns;
 
-                if let Some(last_ns) = last_departure_ns {
-                    statistics.record_inter_arrival_time(clock_ns - last_ns);
+                statistics.record_delay(clock_ns - rx_time_ns);
+                pending_passage.insert(ordinal, (send_time_ns as f64 - rx_time_ns, rx_time_ns));
+                while let Some((delay_ns, time_ns)) = pending_passage.remove(&next_passage_ordinal)
+                {
+                    statistics.record_theoretical_delay(delay_ns, time_ns);
+                    next_passage_ordinal += 1;
                 }
-                last_departure_ns = Some(clock_ns);
-                statistics.record_delay(clock_ns - rx_time_ns, clock_ns);
                 // Dropped packets must not count as reordering: feed the
                 // ordinal among the accepted packets, not the arrival index.
                 statistics.record_sequence_number(ordinal);
-                match burst_virtual_queue.limiter_calculate_offset_ns(clock_ns, frame_byte) {
-                    Some(offset_ns) => statistics.record_burst_spacing_offset(offset_ns),
-                    None => statistics.record_dropped_packet_burst_virtual_queue(),
-                }
                 on_departure(&Departure {
                     seq,
                     rx_time_ns,
@@ -154,11 +153,9 @@ pub fn run_simulation_traced<F: FnMut(&Departure)>(
                     free_slots.push(slot);
                 }
                 match outcome {
-                    PushOutcome::Accepted { send_time_ns } => statistics
-                        .record_theoretical_delay(send_time_ns as f64 - clock_ns, clock_ns),
-                    PushOutcome::Lost => statistics.record_dropped_packet_loss(),
                     PushOutcome::LimiterDrop => statistics.record_dropped_packet_limiter(),
                     PushOutcome::BufferFull => statistics.record_dropped_packet_buffer_full(),
+                    PushOutcome::Accepted { .. } | PushOutcome::Lost => {}
                 }
                 next_seq += 1;
             }

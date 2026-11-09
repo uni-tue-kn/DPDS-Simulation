@@ -275,7 +275,6 @@ impl PassageTimeTracker {
 }
 
 pub struct SimulationStatistics {
-    inter_arrival_time_ns: Histogram<u64>,
     delay_ns: Histogram<u64>,
     reordering_metric: ReorderingMetric,
     /// Sequence numbers we have expected by now but not yet seen.
@@ -287,21 +286,15 @@ pub struct SimulationStatistics {
     tracked_packets: usize,
     out_of_order_packets: usize,
     expected_sequence_number: Option<u64>,
-    measured_passage_time_ns: Histogram<u64>,
-    measured_pt_tracker: Option<PassageTimeTracker>,
     theoretical_passage_time_ns: Histogram<u64>,
     theoretical_pt_tracker: Option<PassageTimeTracker>,
-    dropped_packets_loss: u64,
     dropped_packets_limiter: u64,
     dropped_packets_buffer_full: u64,
-    burst_spacing_offset_ns: Histogram<u64>,
-    dropped_packets_burst_virtual_queue: u64,
 }
 
 impl SimulationStatistics {
     pub fn new(reordering_metric: ReorderingMetric) -> Self {
         Self {
-            inter_arrival_time_ns: Histogram::<u64>::new(3).unwrap(),
             delay_ns: Histogram::<u64>::new(3).unwrap(),
             reordering_metric,
             kendall_tau_missing: MissingRankTree::default(),
@@ -310,40 +303,19 @@ impl SimulationStatistics {
             tracked_packets: 0,
             out_of_order_packets: 0,
             expected_sequence_number: None,
-            measured_passage_time_ns: Histogram::<u64>::new(3).unwrap(),
-            measured_pt_tracker: None,
             theoretical_passage_time_ns: Histogram::<u64>::new(3).unwrap(),
             theoretical_pt_tracker: None,
-            dropped_packets_loss: 0,
             dropped_packets_limiter: 0,
             dropped_packets_buffer_full: 0,
-            burst_spacing_offset_ns: Histogram::<u64>::new(3).unwrap(),
-            dropped_packets_burst_virtual_queue: 0,
         }
     }
 
     pub fn init_passage_time_tracker(&mut self, mean_ns: f64, std_ns: f64) {
-        self.measured_pt_tracker = Some(PassageTimeTracker::new(mean_ns, std_ns));
         self.theoretical_pt_tracker = Some(PassageTimeTracker::new(mean_ns, std_ns));
     }
 
-    pub fn record_inter_arrival_time(&mut self, inter_arrival_time_ns: f64) {
-        self.inter_arrival_time_ns
-            .record(inter_arrival_time_ns.round() as u64)
-            .ok();
-    }
-
-    pub fn record_delay(&mut self, delay_ns: f64, current_simulation_time_ns: f64) {
+    pub fn record_delay(&mut self, delay_ns: f64) {
         self.delay_ns.record(delay_ns.round() as u64).ok();
-
-        // Check for measured passage time if tracker is initialized
-        if let Some(ref mut tracker) = self.measured_pt_tracker
-            && let Some(pt_ns) = tracker.check_delay(delay_ns, current_simulation_time_ns)
-        {
-            self.measured_passage_time_ns
-                .record(pt_ns.round() as u64)
-                .ok();
-        }
     }
 
     pub fn record_theoretical_delay(&mut self, delay_ns: f64, current_simulation_time_ns: f64) {
@@ -357,26 +329,12 @@ impl SimulationStatistics {
         }
     }
 
-    pub fn record_dropped_packet_loss(&mut self) {
-        self.dropped_packets_loss += 1;
-    }
-
     pub fn record_dropped_packet_limiter(&mut self) {
         self.dropped_packets_limiter += 1;
     }
 
     pub fn record_dropped_packet_buffer_full(&mut self) {
         self.dropped_packets_buffer_full += 1;
-    }
-
-    pub fn record_burst_spacing_offset(&mut self, offset_ns: f64) {
-        self.burst_spacing_offset_ns
-            .record(offset_ns.round() as u64)
-            .ok();
-    }
-
-    pub fn record_dropped_packet_burst_virtual_queue(&mut self) {
-        self.dropped_packets_burst_virtual_queue += 1;
     }
 
     pub fn record_sequence_number(&mut self, sequence_number: u64) {
@@ -429,51 +387,25 @@ impl SimulationStatistics {
 
     pub fn get_results(&mut self) -> SimulationResults {
         let n = self.tracked_packets;
-
-        let (
-            kendall_tau_distance,
-            kendall_tau_distance_div_n,
-            out_of_order_packets,
-            out_of_order_packets_div_n,
-        ) = match self.reordering_metric {
-            ReorderingMetric::KendallTauDistance => {
-                let ktd = self.kendall_tau_distance as usize;
-                let ktd_div_n = if n > 0 { ktd as f64 / n as f64 } else { 0.0 };
-                (ktd, ktd_div_n, 0, 0.0)
+        let kendall_tau_distance_div_n = match self.reordering_metric {
+            ReorderingMetric::KendallTauDistance if n > 0 => {
+                self.kendall_tau_distance as f64 / n as f64
             }
-            ReorderingMetric::OutOfOrderCounter => {
-                let ooo_div_n = if n > 0 {
-                    self.out_of_order_packets as f64 / n as f64
-                } else {
-                    0.0
-                };
-                (0, 0.0, self.out_of_order_packets, ooo_div_n)
-            }
+            _ => 0.0,
+        };
+        let out_of_order_packets = match self.reordering_metric {
+            ReorderingMetric::OutOfOrderCounter => self.out_of_order_packets,
+            ReorderingMetric::KendallTauDistance => 0,
         };
 
         SimulationResults {
-            tracked_packets: n,
-            inter_arrival_time_mean_ns: self.inter_arrival_time_ns.mean(),
-            inter_arrival_time_std_ns: self.inter_arrival_time_ns.stdev(),
             delay_mean_ns: self.delay_ns.mean(),
             delay_std_ns: self.delay_ns.stdev(),
-            kendall_tau_distance,
             kendall_tau_distance_div_n,
             out_of_order_packets,
-            out_of_order_packets_div_n,
-            tracked_theoretical_passage_times: self.theoretical_passage_time_ns.len() as usize,
             theoretical_passage_time_mean_ns: self.theoretical_passage_time_ns.mean(),
-            theoretical_passage_time_std_ns: self.theoretical_passage_time_ns.stdev(),
-            tracked_measured_passage_times: self.measured_passage_time_ns.len() as usize,
-            measured_passage_time_mean_ns: self.measured_passage_time_ns.mean(),
-            measured_passage_time_std_ns: self.measured_passage_time_ns.stdev(),
-            dropped_packets_loss: self.dropped_packets_loss,
             dropped_packets_limiter: self.dropped_packets_limiter,
             dropped_packets_buffer_full: self.dropped_packets_buffer_full,
-            burst_spacing_offset_mean_ns: self.burst_spacing_offset_ns.mean(),
-            burst_spacing_offset_std_ns: self.burst_spacing_offset_ns.stdev(),
-            burst_spacing_offset_max_ns: self.burst_spacing_offset_ns.max(),
-            dropped_packets_burst_virtual_queue: self.dropped_packets_burst_virtual_queue,
         }
     }
 }

@@ -41,10 +41,7 @@ df <- data.frame(
     rate_config = character(),
     rate_numeric = numeric(),
     delay_mean_ns = numeric(),
-    delay_std_ns = numeric(),
-    inter_arrival_time_mean_ns = numeric(),
-    inter_arrival_time_std_ns = numeric(),
-    tracked_packets = numeric()
+    delay_std_ns = numeric()
 )
 
 # Read all CSV files for each half_life (filenames encode the half_life t_h)
@@ -85,11 +82,12 @@ if (nrow(dropped_lim) > 0) {
     ))
 }
 
-dropped_bvq <- df %>% filter(dropped_packets_burst_virtual_queue > 0)
-if (nrow(dropped_bvq) > 0) {
+dropped_full <- df %>% filter(dropped_packets_buffer_full > 0)
+if (nrow(dropped_full) > 0) {
     warning(paste0(
-        nrow(dropped_bvq), " run(s) have dropped_packets_burst_virtual_queue > 0 ",
-        "(total dropped: ", sum(dropped_bvq$dropped_packets_burst_virtual_queue), ")"
+        nrow(dropped_full), " run(s) have dropped_packets_buffer_full > 0 ",
+        "(dropped because the buffer was full, total dropped: ", sum(dropped_full$dropped_packets_buffer_full), "). ",
+        "These are not valid runs; re-run them with a larger buffer_capacity"
     ))
 }
 

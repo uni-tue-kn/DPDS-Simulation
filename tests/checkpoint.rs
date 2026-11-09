@@ -24,7 +24,7 @@
 //!   pub struct ConfigProgress {
 //!       pub runs: u32,                           // simulation_config.runs
 //!       pub rows: BTreeMap<u32, Vec<String>>,    // completed run index -> its
-//!                                                // CSV row (the 23 strings of
+//!                                                // CSV row (the CSV_HEADER.len() strings of
 //!                                                // SimulationResults::csv_record)
 //!   }
 //!   impl Checkpoint {
@@ -47,7 +47,7 @@
 //!   pub fn load(path: &Path) -> Result<Checkpoint, String>;
 //!       // STRICT. Err(message) naming `path` for: unreadable, not valid JSON,
 //!       // wrong `format`, `version != VERSION`, a run index >= that config's
-//!       // `runs`, a row that does not have exactly 23 fields. Never modifies
+//!       // `runs`, a row that does not have exactly CSV_HEADER.len() fields. Never modifies
 //!       // the file. Accepts everything `save` can write (round trip).
 //!       // The fingerprint is NOT checked here (the binary compares it with
 //!       // the current configs).
@@ -231,7 +231,7 @@ fn saved_json_has_the_documented_shape() {
     let rows = a["rows"].as_object().unwrap();
     assert_eq!(rows.keys().cloned().collect::<Vec<_>>(), ["0", "3"]);
     assert_eq!(rows["3"], json!(row(3)));
-    assert_eq!(rows["3"].as_array().unwrap().len(), 23);
+    assert_eq!(rows["3"].as_array().unwrap().len(), CSV_HEADER.len());
     assert_eq!(value["configs"]["b.csv"]["runs"], 4);
     assert_eq!(value["configs"]["b.csv"]["rows"], json!({}));
 }
@@ -325,7 +325,7 @@ fn round_trip_with_the_real_rows_including_nan_and_infinite_values() {
     let mut cp = Checkpoint::new(&configs);
     for run in 0..2 {
         let row = run_simulation(&configs[0], run).csv_record(run).to_vec();
-        assert_eq!(row.len(), 23);
+        assert_eq!(row.len(), CSV_HEADER.len());
         cp.record("nan.csv", run, row);
     }
     assert_round_trip("real-rows", &cp);
@@ -567,7 +567,7 @@ fn loader_rejects_rows_whose_first_field_is_not_their_run_index() {
 }
 
 #[test]
-fn loader_rejects_rows_that_do_not_have_23_fields() {
+fn loader_rejects_rows_that_do_not_have_one_field_per_csv_column() {
     rejected_mutation("row-too-short", |v| {
         v["configs"]["a.csv"]["rows"]["0"] = json!(["0", "1"]);
     });

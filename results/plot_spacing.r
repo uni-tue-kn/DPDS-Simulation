@@ -32,10 +32,7 @@ df <- data.frame(
     rate_config = character(),
     rate_numeric = numeric(),
     delay_mean_ns = numeric(),
-    delay_std_ns = numeric(),
-    inter_arrival_time_mean_ns = numeric(),
-    inter_arrival_time_std_ns = numeric(),
-    tracked_packets = numeric()
+    delay_std_ns = numeric()
 )
 
 # Read all CSV files
@@ -103,11 +100,12 @@ if (nrow(dropped_lim) > 0) {
     ))
 }
 
-dropped_bvq <- df %>% filter(dropped_packets_burst_virtual_queue > 0)
-if (nrow(dropped_bvq) > 0) {
+dropped_full <- df %>% filter(dropped_packets_buffer_full > 0)
+if (nrow(dropped_full) > 0) {
     warning(paste0(
-        nrow(dropped_bvq), " run(s) have dropped_packets_burst_virtual_queue > 0 ",
-        "(total dropped: ", sum(dropped_bvq$dropped_packets_burst_virtual_queue), ")"
+        nrow(dropped_full), " run(s) have dropped_packets_buffer_full > 0 ",
+        "(dropped because the buffer was full, total dropped: ", sum(dropped_full$dropped_packets_buffer_full), "). ",
+        "These are not valid runs; re-run them with a larger buffer_capacity"
     ))
 }
 
@@ -119,10 +117,7 @@ df <- df %>%
         delay_deviation_ms = (delay_mean_ns - configured_delay_ns) / 1e6,
         jitter_deviation_ms = (delay_std_ns - configured_jitter_ns) / 1e6,
         delay_deviation_pct = (delay_mean_ns - configured_delay_ns) / configured_delay_ns * 100,
-        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100,
-        theoretical_iat_ns = (1538 * 8) / rate_numeric,
-        iat_deviation_pct = (inter_arrival_time_mean_ns - theoretical_iat_ns) / theoretical_iat_ns * 100,
-        iat_cvar = inter_arrival_time_std_ns / inter_arrival_time_mean_ns
+        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100
     )
 
 # Aggregate statistics: calculate mean and standard deviation across all runs
@@ -133,18 +128,12 @@ df_aggregated <- df %>%
         delay_mean_ns_sd = sd(delay_mean_ns),
         delay_std_ns_avg = mean(delay_std_ns),
         delay_std_ns_sd = sd(delay_std_ns),
-        inter_arrival_time_mean_ns_avg = mean(inter_arrival_time_mean_ns),
-        inter_arrival_time_mean_ns_sd = sd(inter_arrival_time_mean_ns),
-        inter_arrival_time_std_ns_avg = mean(inter_arrival_time_std_ns),
-        inter_arrival_time_std_ns_sd = sd(inter_arrival_time_std_ns),
         kendall_tau_distance_div_n_avg = mean(kendall_tau_distance_div_n),
         kendall_tau_distance_div_n_sd = sd(kendall_tau_distance_div_n),
         out_of_order_packets_avg = mean(out_of_order_packets),
         out_of_order_packets_sd = sd(out_of_order_packets),
         theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
         theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
-        measured_passage_time_mean_ns_avg = mean(measured_passage_time_mean_ns),
-        measured_passage_time_mean_ns_sd = sd(measured_passage_time_mean_ns),
         delay_deviation_ms_avg = mean(delay_deviation_ms),
         delay_deviation_ms_sd = sd(delay_deviation_ms),
         jitter_deviation_ms_avg = mean(jitter_deviation_ms),
@@ -153,16 +142,8 @@ df_aggregated <- df %>%
         delay_deviation_pct_sd = sd(delay_deviation_pct),
         jitter_deviation_pct_avg = mean(jitter_deviation_pct),
         jitter_deviation_pct_sd = sd(jitter_deviation_pct),
-        iat_deviation_pct_avg = mean(iat_deviation_pct),
-        iat_deviation_pct_sd = sd(iat_deviation_pct),
-        iat_cvar_avg = mean(iat_cvar),
-        iat_cvar_sd = sd(iat_cvar),
         dropped_packets_limiter_avg = mean(dropped_packets_limiter),
         dropped_packets_limiter_sd = sd(dropped_packets_limiter),
-        burst_spacing_offset_mean_ns_avg = mean(burst_spacing_offset_mean_ns),
-        burst_spacing_offset_mean_ns_sd = sd(burst_spacing_offset_mean_ns),
-        burst_spacing_offset_max_ns_avg = mean(burst_spacing_offset_max_ns),
-        burst_spacing_offset_max_ns_sd = sd(burst_spacing_offset_max_ns),
         n_runs = n(),
         .groups = "drop"
     )

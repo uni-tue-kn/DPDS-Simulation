@@ -4,8 +4,8 @@
 //! Spec requirements covered: one CSV per config, header + one row per run,
 //! rows sorted by run index, results independent of the worker count
 //! (`MAX_CONCURRENT_SIMULATIONS`, fixed seed => byte-identical files), the
-//! renamed/new drop columns, the release profile in `Cargo.toml`, and static
-//! checks of the repository (R scripts, dependencies, README). The
+//! slim CSV header, the release profile in `Cargo.toml`, and static
+//! checks of the repository (dependencies, README). The
 //! checkpoint/resume behaviour is tested in `checkpoint_cli.rs`.
 
 mod common;
@@ -42,25 +42,16 @@ fn configs_json() -> String {
 
 const FILES: [&str; 3] = ["a_fifo.csv", "b_reorder.csv", "c_spacer.csv"];
 
-/// Columns that exist before and after the redesign, in this order at the
-/// start of the header.
-const COMMON_PREFIX: [&str; 16] = [
+/// The result columns: only those that feed a PDF.
+const EXPECTED_HEADER: [&str; 8] = [
     "run",
-    "tracked_packets",
-    "inter_arrival_time_mean_ns",
-    "inter_arrival_time_std_ns",
     "delay_mean_ns",
     "delay_std_ns",
-    "kendall_tau_distance",
     "kendall_tau_distance_div_n",
     "out_of_order_packets",
-    "out_of_order_packets_div_n",
-    "tracked_theoretical_passage_times",
     "theoretical_passage_time_mean_ns",
-    "theoretical_passage_time_std_ns",
-    "tracked_measured_passage_times",
-    "measured_passage_time_mean_ns",
-    "measured_passage_time_std_ns",
+    "dropped_packets_limiter",
+    "dropped_packets_buffer_full",
 ];
 
 #[test]
@@ -76,34 +67,12 @@ fn every_config_gets_its_own_complete_csv() {
 }
 
 #[test]
-fn csv_header_keeps_the_unchanged_columns() {
+fn csv_header_has_exactly_the_plotted_columns() {
     let results = run_sweep("driver-header", &configs_json(), Some("2"));
     for file in FILES {
         let (header, _) = read_csv(&results.join(file));
-        assert_eq!(header[..COMMON_PREFIX.len()], COMMON_PREFIX, "{file}");
-        for name in [
-            "burst_spacing_offset_mean_ns",
-            "burst_spacing_offset_std_ns",
-            "burst_spacing_offset_max_ns",
-            "dropped_packets_burst_virtual_queue",
-        ] {
-            assert!(header.iter().any(|h| h == name), "{file}: missing {name}");
-        }
+        assert_eq!(header, EXPECTED_HEADER, "{file}");
     }
-}
-
-#[test]
-fn csv_header_has_the_new_drop_columns_and_no_bandwidth_column() {
-    let results = run_sweep("driver-dropcols", &configs_json(), Some("2"));
-    let (header, _) = read_csv(&results.join("a_fifo.csv"));
-    for name in [
-        "dropped_packets_loss",
-        "dropped_packets_limiter",
-        "dropped_packets_buffer_full",
-    ] {
-        assert!(header.iter().any(|h| h == name), "missing {name}");
-    }
-    assert!(!header.iter().any(|h| h == "dropped_packets_bandwidth"));
 }
 
 #[test]
@@ -202,57 +171,6 @@ fn release_profile_has_lto_single_codegen_unit_and_abort() {
 fn read_repo_file(relative: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
-}
-
-fn r_scripts() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
-    let mut scripts: Vec<(String, String)> = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "r"))
-        .map(|p| {
-            (
-                p.file_name().unwrap().to_string_lossy().into_owned(),
-                fs::read_to_string(&p).unwrap(),
-            )
-        })
-        .collect();
-    scripts.sort();
-    scripts
-}
-
-#[test]
-fn no_r_script_reads_the_removed_dropped_packets_bandwidth_column() {
-    // H2: the CSV column is `dropped_packets_limiter` now
-    let scripts = r_scripts();
-    assert!(scripts.len() >= 5, "found only {} R scripts", scripts.len());
-    for (name, text) in &scripts {
-        assert!(
-            !text.contains("dropped_packets_bandwidth"),
-            "{name} still references dropped_packets_bandwidth"
-        );
-    }
-}
-
-#[test]
-fn the_plot_scripts_that_check_for_drops_use_the_limiter_column() {
-    let scripts = r_scripts();
-    for wanted in [
-        "plot_delays.r",
-        "plot_distributions.r",
-        "plot_spacing.r",
-        "plot_half_life.r",
-        "plot_results.r",
-    ] {
-        let (_, text) = scripts
-            .iter()
-            .find(|(name, _)| name == wanted)
-            .unwrap_or_else(|| panic!("results/{wanted} missing"));
-        assert!(
-            text.contains("dropped_packets_limiter"),
-            "{wanted} must read dropped_packets_limiter"
-        );
-    }
 }
 
 #[test]

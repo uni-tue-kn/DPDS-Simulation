@@ -67,7 +67,6 @@ df_ktau_reorder <- read_dataset("reorder_kendalltau", "reorder")
 df_ktau_corr <- df_ktau_reorder %>%
     mutate(
         prefix = "correlation30",
-        kendall_tau_distance = 0,
         kendall_tau_distance_div_n = 0
     )
 df_ktau_raw <- rbind(df_ktau_reorder, df_ktau_corr)

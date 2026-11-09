@@ -490,7 +490,7 @@ fn slow_rows() -> &'static BTreeMap<String, Vec<Vec<String>>> {
 const SENTINEL: &str = "7770000";
 
 /// What a checkpoint stores for a run in the tests that plant rows: the
-/// genuine row with a recognisable `tracked_packets`. A resumed sweep that
+/// genuine row with a recognisable value in column 1. A resumed sweep that
 /// re-ran the run would overwrite it with the genuine value.
 fn sentinel_row(genuine: &[String]) -> Vec<String> {
     let mut row = genuine.to_vec();
@@ -1124,7 +1124,8 @@ fn corrupt_checkpoints_abort_for_every_kind_of_damage() {
         (
             "run index out of range",
             mutated(&|v| {
-                v["configs"]["a_fifo.csv"]["rows"]["6"] = json!(vec!["0"; 23]);
+                v["configs"]["a_fifo.csv"]["rows"]["6"] =
+                    json!(vec!["0"; lib::results::CSV_HEADER.len()]);
             }),
         ),
         (

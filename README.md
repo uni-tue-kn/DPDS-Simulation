@@ -4,8 +4,7 @@ A discrete-event simulation of a network-link emulator. It models packets
 flowing through a configurable **delayer** (variable latency / jitter, optionally
 correlation, drawn from several distributions), a **rate limiter** and a **loss
 model**, then measures the statistics that characterise the emulated link: one-way delay,
-inter-arrival time (jitter), packet reordering, delay *passage times*, burst
-spacing, and packet drops.
+delay jitter, packet reordering, delay *passage times* and limiter drops.
 
 It is the simulation companion to the
 [`dpds-core`](https://github.com/uni-tue-kn/DPDS/tree/nightly/crates/dpds-core) crate
@@ -62,14 +61,15 @@ Rules:
   when blocked behind a later packet, right after its predecessor.
 - The packet handed to the buffer is the opaque pointer `seq + 1` (never
   dereferenced); its arrival time is recomputed from `seq`.
-- Theoretical passage time: the tracker is fed `send_time - rx` at the arrival
-  of every accepted packet. Measured passage time and the delay histogram use
-  `tx - rx` at the departure.
+- Theoretical passage time: the tracker is fed the send time that
+  `pop_due_with_time` reports at the departure minus the arrival time (`rx`),
+  with `rx` as time axis, in accepted-packet order: a packet that departs
+  before an earlier accepted one waits until that one has departed (identical
+  to feeding at push in FIFO mode). The delay histogram uses `tx - rx` at the
+  departure.
 - Frame length passed to the buffer is `ceil(average_frame_size_byte)`;
   `dpds-core` adds 4 bytes (FEC) and the 20 bytes of L1 overhead itself, so
   the limiter sees `(ceil(frame) + 4 + 20) * 8` bit.
-- The burst virtual queue is unchanged: a `Spacer` at `rate_gbps / 0.9` fed at
-  each departure with `ceil(frame)` bytes (no FEC), recording the offsets.
 
 ## Running a simulation
 
@@ -162,24 +162,18 @@ which the buffer bounds as well: dpds-core derives the limiter limit as
 and checks for buffer room before the delay, spacing and loss. For the committed grid the largest value is the
 100 Gbit/s, 100 ms configuration: 8.13 Mpps * 100 ms = 0.81 M packets, 0.96 M
 at mean + 6 std (a 0.6 s simulated run of its four jitter variants showed no
-`dropped_packets_buffer_full`). 2^21 therefore holds with a margin of about a
+buffer-full drops). 2^21 therefore holds with a margin of about a
 factor of 2.2 over the worst config, not orders of magnitude: when adding
 configs with a larger rate-delay product, set `buffer_capacity` explicitly and
-check that `dropped_packets_buffer_full` is 0.
+check that `dropped_packets_buffer_full` stays 0 (runs with drops for lack of
+buffer room are not valid and should be re-run with a larger `buffer_capacity`).
 
 Each output CSV contains one row per run with the following columns:
 
 ```
-run, tracked_packets,
-inter_arrival_time_mean_ns, inter_arrival_time_std_ns,
-delay_mean_ns, delay_std_ns,
-kendall_tau_distance, kendall_tau_distance_div_n,
-out_of_order_packets, out_of_order_packets_div_n,
-tracked_theoretical_passage_times, theoretical_passage_time_mean_ns, theoretical_passage_time_std_ns,
-tracked_measured_passage_times, measured_passage_time_mean_ns, measured_passage_time_std_ns,
-dropped_packets_loss, dropped_packets_limiter, dropped_packets_buffer_full,
-burst_spacing_offset_mean_ns, burst_spacing_offset_std_ns, burst_spacing_offset_max_ns,
-dropped_packets_burst_virtual_queue
+run, delay_mean_ns, delay_std_ns, kendall_tau_distance_div_n,
+out_of_order_packets, theoretical_passage_time_mean_ns, dropped_packets_limiter,
+dropped_packets_buffer_full
 ```
 
 ## Running the benchmark
@@ -260,7 +254,7 @@ dpds-core = { git = "https://github.com/uni-tue-kn/DPDS", branch = "nightly" }
 The committed `Cargo.lock` pins the exact revision used, so builds are
 reproducible. To update to a newer `dpds-core`, run `cargo update -p dpds-core`.
 The simulation runs the real `dpds-core` `Buffer` (with its `Delayer`, `Limiter`
-and `Dropper`) and uses `Limiter` for the burst virtual queue. It relies on the
+and `Dropper`). It relies on the
 serde derives of `RVDistribution`, `LimiterMode` and `LossModel`, which come
 from `dpds-core`'s default `json` feature (implies `serde`).
 
@@ -306,19 +300,17 @@ of the paper):
   (`arrival + delay`), as in the real emulator, not at the transmit time.
   Packets the limiter rejects are really dropped; the old model still
   transmitted them (it only counted them).
-- `dropped_packets_bandwidth` is replaced (in place) by
-  `dropped_packets_loss`, `dropped_packets_limiter` and
-  `dropped_packets_buffer_full`. If a packet is both lost and rejected by the
+- `dropped_packets_bandwidth` is replaced by `dropped_packets_limiter`; buffer
+  rejections are counted in `dropped_packets_buffer_full`. If a packet is both lost and rejected by the
   limiter, it counts as lost.
 - New optional config fields `buffer_capacity`, `loss_model`, `seed`.
 - Results include the 4 FEC bytes `dpds-core` adds to every frame for the
-  limiter (the burst virtual queue does not).
+  limiter.
 - The correlated delayer starts from the config's offered packet rate
   (`initialization_rate_pps` = 1e9 / inter-arrival time in ns, a required
   `dpds-core` field), as the old model did; it is derived, not a config field.
 - Every departure is tracked; the old model skipped the first packet.
-  `inter_arrival_time_*` describes the `n - 1` departure gaps.
-- Theoretical passage times use the buffer's whole-ns send time minus the
+- Theoretical passage times use the buffer's whole-ns send time (at pop) minus the
   arrival time (so including truncation and limiter offset), not the raw
   sampled delay.
 - Send times are truncated to whole ns by the buffer (and, in reordering mode,
