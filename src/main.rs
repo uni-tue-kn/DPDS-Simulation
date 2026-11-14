@@ -3,6 +3,7 @@
 //! interrupted sweep can be resumed (see the README).
 
 use lib::{
+    affinity,
     checkpoint::{self, Checkpoint, ConfigProgress},
     config::Config,
     results::csv_bytes,
@@ -30,7 +31,7 @@ const SECOND_SIGNAL_EXIT_CODE: i32 = 130;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 const USAGE: &str = "usage: dpds_simulation [--resume | --fresh] [--dry-run] \
-[--stop-at HH:MM] [--start-at HH:MM]";
+[--pin-workers] [--stop-at HH:MM] [--start-at HH:MM]";
 
 // ----------------------------------------------------------------- arguments
 
@@ -39,6 +40,7 @@ struct Args {
     resume: bool,
     fresh: bool,
     dry_run: bool,
+    pin_workers: bool,
     /// Time of day (local), as the offset from midnight.
     stop_at: Option<Duration>,
     start_at: Option<Duration>,
@@ -52,6 +54,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--resume" => parsed.resume = true,
             "--fresh" => parsed.fresh = true,
             "--dry-run" => parsed.dry_run = true,
+            "--pin-workers" => parsed.pin_workers = true,
             "--stop-at" | "--start-at" => {
                 let value = args.next().ok_or(format!("{arg} needs a value HH:MM"))?;
                 let time = parse_time_of_day(&value).ok_or(format!(
@@ -530,8 +533,17 @@ fn main() {
 Press Ctrl+C again to exit immediately."
             );
         });
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_count().min(sweep.jobs.len()))
+        let mut builder =
+            rayon::ThreadPoolBuilder::new().num_threads(worker_count().min(sweep.jobs.len()));
+        if args.pin_workers {
+            // Read once; a worker that cannot be pinned ends the process.
+            let allowed = affinity::allowed_cpus().unwrap_or_else(|e| fail(&e));
+            builder = builder.start_handler(move |worker| {
+                affinity::pin_current_thread(affinity::worker_cpu(&allowed, worker))
+                    .unwrap_or_else(|e| fail(&e));
+            });
+        }
+        let pool = builder
             .build()
             .unwrap_or_else(|e| fail(&format!("cannot start the worker pool: {e}")));
         pool.broadcast(|_| sweep.work());

@@ -99,7 +99,7 @@ count and for any order or interruption of the runs.
 ### Options
 
 ```text
-dpds_simulation [--resume | --fresh] [--dry-run] [--stop-at HH:MM] [--start-at HH:MM]
+dpds_simulation [--resume | --fresh] [--dry-run] [--pin-workers] [--stop-at HH:MM] [--start-at HH:MM]
 ```
 
 | Option             | Effect                                                                                                            |
@@ -107,8 +107,17 @@ dpds_simulation [--resume | --fresh] [--dry-run] [--stop-at HH:MM] [--start-at H
 | `--resume`         | Continue from an existing checkpoint without asking.                                                              |
 | `--fresh`          | Delete an existing checkpoint (even an unusable one) and start over without asking. Exclusive with `--resume`.     |
 | `--dry-run`        | Print the job plan (configs, runs, estimated simulated packets, checkpoint state) and exit; writes nothing.      |
+| `--pin-workers`    | Pin worker thread *i* to the (*i* mod *n*)-th CPU, ascending, of the *n* CPUs the process may run on (Linux only; an error elsewhere). |
 | `--stop-at HH:MM`  | Stop handing out jobs at that local time (next occurrence), then behave like a first Ctrl+C.                      |
 | `--start-at HH:MM` | Wait until that local time (next occurrence) before starting (after any checkpoint question).                         |
+
+By default the number of workers is the number of CPUs the process may run on
+(the `MAX_CONCURRENT_SIMULATIONS` environment variable overrides it), and the
+operating system places the threads. On machines with scheduler-isolated cores
+(`isolcpus`) the scheduler does not spread threads across an affinity mask, so
+they can pile up on one core. There, combine `taskset -c <cpus>` with
+`--pin-workers`, for example `taskset -c 2-5 dpds_simulation --pin-workers`.
+`dpds_benchmark` is single-threaded and only needs `taskset -c <cpu>`.
 
 ### Checkpoint and resume
 
@@ -160,10 +169,12 @@ capacity has to exceed the number of packets in flight, about
 which the buffer bounds as well: dpds-core derives the limiter limit as
 `buffer_capacity * 1542 B * 8` (1518 B maximum frame + 4 FEC + 20 B L1 overhead)
 and checks for buffer room before the delay, spacing and loss. For the committed grid the largest value is the
-100 Gbit/s, 100 ms configuration: 8.13 Mpps * 100 ms = 0.81 M packets, 0.96 M
-at mean + 6 std (a 0.6 s simulated run of its four jitter variants showed no
-buffer-full drops). 2^21 therefore holds with a margin of about a
-factor of 2.2 over the worst config, not orders of magnitude: when adding
+100 Gbit/s, 30 ms configuration: 8.13 Mpps * 30 ms = 0.24 M packets, 0.39 M
+at mean + 6 std (its largest jitter, 3 ms, gives 48 ms). 2^21 therefore holds
+with a margin of about a factor of 5.4 over the worst config by this
+estimate (a 90 s simulated run of it peaked at 0.35 M packets in flight; the
+99 % spacer configs at 100 Gbit/s, whose limiter queue adds to the delay,
+peaked at 0.20 M in 400 s), not orders of magnitude: when adding
 configs with a larger rate-delay product, set `buffer_capacity` explicitly and
 check that `dropped_packets_buffer_full` stays 0 (runs with drops for lack of
 buffer room are not valid and should be re-run with a larger `buffer_capacity`).
@@ -224,7 +235,7 @@ has a required `simulation_config` and optional `delay_config` and
 ```
 
 The committed `simulation_configs.json` encodes the full experiment grid used for
-the analysis (316 configurations sweeping distribution, delay, jitter, rate,
+the analysis (204 configurations sweeping distribution, delay, jitter, rate,
 correlation, and limiter settings).
 
 ## Generating plots

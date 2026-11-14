@@ -15,7 +15,7 @@
 //! # Test-facing CLI fixed by these tests
 //!
 //! ```text
-//! dpds_simulation [--resume | --fresh] [--dry-run] [--stop-at HH:MM] [--start-at HH:MM]
+//! dpds_simulation [--resume | --fresh] [--dry-run] [--pin-workers] [--stop-at HH:MM] [--start-at HH:MM]
 //! ```
 //!
 //! Reads `simulation_configs.json` from the working directory, writes the
@@ -1353,6 +1353,94 @@ fn valid_times_are_accepted() {
     ] {
         let outcome = run(&small.scratch, &args, &[], None);
         assert_success(&outcome);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_workers_write_the_same_results_as_unpinned_ones() {
+    // the expected CSVs are the genuine seeded runs, which unpinned sweeps
+    // reproduce byte for byte; 64 workers exceed the CPUs, so pins wrap
+    for workers in ["1", "3", "64"] {
+        let small = Small::new("pin-flow");
+        let env = [("MAX_CONCURRENT_SIMULATIONS", workers)];
+        assert_success(&run(&small.scratch, &["--pin-workers"], &env, None));
+        assert_results_are(&small.scratch, &small.expect_fresh());
+    }
+}
+
+/// CPU numbers of a `Cpus_allowed_list` value such as `0-3,5`.
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    list.trim()
+        .split(',')
+        .flat_map(|part| match part.split_once('-') {
+            Some((a, b)) => a.parse().unwrap()..=b.parse().unwrap(),
+            None => part.parse().unwrap()..=part.parse().unwrap(),
+        })
+        .collect()
+}
+
+/// The allowed CPUs of every thread of `pid` that is currently pinned to a
+/// single CPU, and the number of threads (Linux `/proc`).
+fn pinned_cpus_and_thread_count(pid: u32) -> (BTreeSet<usize>, usize) {
+    let mut pinned = BTreeSet::new();
+    let mut threads = 0;
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap().flatten() {
+        let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+            continue; // the thread ended meanwhile
+        };
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .unwrap();
+        threads += 1;
+        if let [cpu] = parse_cpu_list(list)[..] {
+            pinned.insert(cpu);
+        }
+    }
+    (pinned, threads)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pin_workers_pins_worker_i_to_the_i_th_allowed_cpu_and_without_it_nothing_is_pinned() {
+    const WORKERS: usize = 3;
+    let allowed = parse_cpu_list(
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .unwrap(),
+    );
+    let expected: BTreeSet<usize> = (0..WORKERS).map(|i| allowed[i % allowed.len()]).collect();
+    // three runs that never end: the pool exists until the process is killed
+    let text = to_text(&[config_json("n.csv", 3, NEVER_ENDS_S, true, 1, no_extras)]);
+    for pin in [true, false] {
+        let scratch = Scratch::new("pin-cpus", &text);
+        let mut command = scratch.command(if pin { &["--pin-workers"] } else { &[] });
+        command.env("MAX_CONCURRENT_SIMULATIONS", WORKERS.to_string());
+        let proc = Proc::spawn(command, None);
+        let pid = proc.child.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (pinned, threads) = loop {
+            let (pinned, threads) = pinned_cpus_and_thread_count(pid);
+            // main thread + the workers are up; pinning happens at their start
+            let ready = if pin {
+                pinned == expected
+            } else {
+                threads > WORKERS
+            };
+            if ready || Instant::now() > deadline {
+                break (pinned, threads);
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        if pin {
+            assert_eq!(pinned, expected, "pinned CPUs of {threads} threads");
+        } else if allowed.len() > 1 {
+            assert!(threads > WORKERS, "workers did not start");
+            assert!(pinned.is_empty(), "nothing may be pinned: {pinned:?}");
+        }
     }
 }
 

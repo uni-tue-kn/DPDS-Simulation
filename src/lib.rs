@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod checkpoint;
 pub mod config;
 pub mod results;

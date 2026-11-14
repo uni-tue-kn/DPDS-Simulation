@@ -73,8 +73,8 @@ df$jitter_config <- factor(df$jitter_config,
 )
 
 df$delay_config <- factor(df$delay_config,
-    levels = c("3ms", "10ms", "30ms", "100ms"),
-    labels = c("3 ms", "10 ms", "30 ms", "100 ms")
+    levels = c("3ms", "10ms", "30ms"),
+    labels = c("3 ms", "10 ms", "30 ms")
 )
 
 ##################################################################################################
@@ -208,7 +208,7 @@ for (dist in distributions) {
         geom_point(size = point_size, position = dodge) +
         scale_x_continuous(breaks = rate_positions, labels = rate_levels) +
         scale_y_continuous(labels = label_number(big.mark = " ")) +
-        scale_color_manual(values = c("3 ms" = "#000000", "10 ms" = "#0072B2", "30 ms" = "#D55E00", "100 ms" = "#E69F00")) +
+        scale_color_manual(values = c("3 ms" = "#000000", "10 ms" = "#0072B2", "30 ms" = "#D55E00")) +
         scale_shape_manual(values = c("0.1 ms" = 16, "0.3 ms" = 17, "1 ms" = 15, "3 ms" = 18)) +
         guides(shape = guide_legend(order = 1), color = guide_legend(order = 2, override.aes = list(shape = NA, linewidth = 2))) +
         base_theme +
@@ -251,7 +251,7 @@ for (dist in distributions) {
         scale_x_continuous(breaks = rate_positions, labels = rate_levels) +
         scale_y_continuous(labels = label_number(big.mark = " ")) +
         expand_limits(y = 0) +
-        scale_color_manual(values = c("3 ms" = "#000000", "10 ms" = "#0072B2", "30 ms" = "#D55E00", "100 ms" = "#E69F00")) +
+        scale_color_manual(values = c("3 ms" = "#000000", "10 ms" = "#0072B2", "30 ms" = "#D55E00")) +
         scale_shape_manual(values = c("0.1 ms" = 16, "0.3 ms" = 17, "1 ms" = 15, "3 ms" = 18)) +
         guides(shape = guide_legend(order = 1), color = guide_legend(order = 2, override.aes = list(shape = NA, linewidth = 2))) +
         base_theme +

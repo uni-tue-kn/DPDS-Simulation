@@ -6,7 +6,7 @@ use dpds_core::{delayer::RVDistribution, limiter::LimiterMode};
 use lib::config::Config;
 use lib::simulation::buffer_config;
 use lib::statistics::ReorderingMetric;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 fn parse(json: &str) -> Config {
     serde_json::from_str(json).expect("config must parse")
@@ -142,6 +142,61 @@ fn simulation_configs_json_parses_and_is_well_formed() {
             assert!(l.rate_bps > 0.);
         }
     }
+}
+
+#[test]
+fn simulation_configs_json_holds_exactly_the_cells_the_paper_shows() {
+    // What results/plot_*.r read: 16 cells (4 jitters x 4 rates) per series,
+    // 4 cells (jitter 3000us only) for the other delay distributions.
+    let jitters = ["100us", "300us", "1000us", "3000us"];
+    let rates = ["0.1Gbps", "1Gbps", "10Gbps", "100Gbps"];
+    let full_grids = [
+        "basic_normal_10ms",
+        "reorder_normal_10ms",
+        "reorder_kendalltau_normal_10ms",
+        "correlation10_normal_10ms",
+        "correlation30_normal_3ms",
+        "correlation30_normal_10ms",
+        "correlation30_normal_30ms",
+        "correlation100_normal_10ms",
+        "reorder_spacer80_normal_10ms",
+        "reorder_spacer99_normal_10ms",
+        "correlation30_spacer80_normal_10ms",
+        "correlation30_spacer99_normal_10ms",
+    ];
+    let jitter_3000_only = [
+        "correlation30_uniform_10ms",
+        "correlation30_gamma_10ms",
+        "correlation30_lognormal_10ms",
+    ];
+    let mut expected = BTreeSet::new();
+    for stem in full_grids {
+        for jitter in jitters {
+            for rate in rates {
+                expected.insert(format!("{stem}_{jitter}_{rate}.csv"));
+            }
+        }
+    }
+    for stem in jitter_3000_only {
+        for rate in rates {
+            expected.insert(format!("{stem}_3000us_{rate}.csv"));
+        }
+    }
+    assert_eq!(expected.len(), 12 * 16 + 3 * 4);
+
+    let text = include_str!("../simulation_configs.json");
+    let configs: Vec<Config> = serde_json::from_str(text).unwrap();
+    let actual: BTreeSet<String> = configs
+        .iter()
+        .map(|c| c.simulation_config.csv_output_path.clone())
+        .collect();
+    let extra: Vec<_> = actual.difference(&expected).collect();
+    let missing: Vec<_> = expected.difference(&actual).collect();
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "unexpected configs: {extra:?}\nmissing configs: {missing:?}"
+    );
+    assert_eq!(configs.len(), expected.len(), "duplicate configs");
 }
 
 #[test]

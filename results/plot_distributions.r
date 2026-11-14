@@ -78,8 +78,8 @@ df$jitter_config <- factor(df$jitter_config,
 )
 
 df$delay_config <- factor(df$delay_config,
-    levels = c("3ms", "10ms", "30ms", "100ms"),
-    labels = c("3 ms", "10 ms", "30 ms", "100 ms")
+    levels = c("3ms", "10ms", "30ms"),
+    labels = c("3 ms", "10 ms", "30 ms")
 )
 
 ##################################################################################################

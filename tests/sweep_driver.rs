@@ -288,3 +288,17 @@ fn a_config_with_limit_bit_makes_the_binary_fail_naming_the_key() {
     assert!(stderr.contains("limit_bit"), "{stderr}");
     assert!(!dir.join("results").join("stale.csv").exists());
 }
+
+#[test]
+fn worker_cpu_maps_workers_onto_the_allowed_cpus_in_order_and_wraps_around() {
+    // CPU numbers, not positions: an allowed set like `taskset -c 1,4,6`.
+    let allowed = [1, 4, 6];
+    let cpus: Vec<usize> = (0..7)
+        .map(|worker| lib::affinity::worker_cpu(&allowed, worker))
+        .collect();
+    assert_eq!(cpus, [1, 4, 6, 1, 4, 6, 1]);
+    // a single allowed CPU takes every worker
+    assert!((0..5).all(|w| lib::affinity::worker_cpu(&[3], w) == 3));
+    // far more workers than CPUs still lands in the set
+    assert!((0..1000).all(|w| allowed.contains(&lib::affinity::worker_cpu(&allowed, w))));
+}
