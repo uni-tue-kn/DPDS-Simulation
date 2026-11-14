@@ -1,4 +1,5 @@
-//! Checkpoint of a sweep: the CSV row of every completed `(config, run)`.
+//! Checkpoint of a sweep: the CSV row and the delay quantiles of every
+//! completed `(config, run)`.
 //!
 //! The file `results/.checkpoint.json` is rewritten atomically (temp file in
 //! the same directory, fsync, rename, fsync of the directory) after every
@@ -12,7 +13,7 @@
 //! compared by the caller.
 
 use crate::config::Config;
-use crate::results::CSV_HEADER;
+use crate::results::{CSV_HEADER, QUANTILE_PROBABILITIES};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FORMAT: &str = "dpds-simulation-checkpoint";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Name of the checkpoint file inside the results directory.
 pub const FILE_NAME: &str = ".checkpoint.json";
 
@@ -44,6 +45,8 @@ pub struct ConfigProgress {
     pub runs: u32,
     /// Completed run index -> its CSV row (see `SimulationResults::csv_record`).
     pub rows: BTreeMap<u32, Vec<String>>,
+    /// Completed run index -> its `SimulationResults::delay_quantiles_ns`.
+    pub quantiles: BTreeMap<u32, Vec<u64>>,
 }
 
 impl ConfigProgress {
@@ -74,6 +77,7 @@ impl Checkpoint {
                         ConfigProgress {
                             runs: c.simulation_config.runs,
                             rows: BTreeMap::new(),
+                            quantiles: BTreeMap::new(),
                         },
                     )
                 })
@@ -83,12 +87,19 @@ impl Checkpoint {
 
     /// Records a completed run. Panics if `csv_output_path` is not one of the
     /// configs the checkpoint was created for.
-    pub fn record(&mut self, csv_output_path: &str, run: u32, row: Vec<String>) {
-        self.configs
+    pub fn record(
+        &mut self,
+        csv_output_path: &str,
+        run: u32,
+        row: Vec<String>,
+        quantiles: Vec<u64>,
+    ) {
+        let progress = self
+            .configs
             .get_mut(csv_output_path)
-            .unwrap_or_else(|| panic!("{csv_output_path} is not part of the checkpoint"))
-            .rows
-            .insert(run, row);
+            .unwrap_or_else(|| panic!("{csv_output_path} is not part of the checkpoint"));
+        progress.rows.insert(run, row);
+        progress.quantiles.insert(run, quantiles);
         self.updated_unix_s = unix_now_s();
     }
 
@@ -188,6 +199,20 @@ pub fn load(path: &Path) -> Result<Checkpoint, String> {
         )));
     }
     for (csv, progress) in &checkpoint.configs {
+        if !progress.rows.keys().eq(progress.quantiles.keys()) {
+            return Err(fail(format!(
+                "{csv}: the runs with a row and the runs with quantiles differ"
+            )));
+        }
+        for (run, quantiles) in &progress.quantiles {
+            if quantiles.len() != QUANTILE_PROBABILITIES.len() {
+                return Err(fail(format!(
+                    "{csv}: run {run} has {} quantiles, expected {}",
+                    quantiles.len(),
+                    QUANTILE_PROBABILITIES.len()
+                )));
+            }
+        }
         for (run, row) in &progress.rows {
             if *run >= progress.runs {
                 return Err(fail(format!(

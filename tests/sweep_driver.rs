@@ -11,6 +11,7 @@
 mod common;
 
 use common::{read_csv, run_sweep};
+use lib::results::QUANTILE_PROBABILITIES;
 use std::fs;
 
 const RUNS: u32 = 7;
@@ -42,6 +43,16 @@ fn configs_json() -> String {
 
 const FILES: [&str; 3] = ["a_fifo.csv", "b_reorder.csv", "c_spacer.csv"];
 
+/// The result CSVs and the quantile files next to them.
+const ALL_FILES: [&str; 6] = [
+    "a_fifo.csv",
+    "a_fifo_quantiles.csv",
+    "b_reorder.csv",
+    "b_reorder_quantiles.csv",
+    "c_spacer.csv",
+    "c_spacer_quantiles.csv",
+];
+
 /// The result columns: only those that feed a PDF.
 const EXPECTED_HEADER: [&str; 8] = [
     "run",
@@ -62,6 +73,23 @@ fn every_config_gets_its_own_complete_csv() {
         assert_eq!(rows.len(), RUNS as usize, "{file}");
         for row in &rows {
             assert_eq!(row.len(), header.len(), "{file}: row shape");
+        }
+        // one row per (run, probability), sorted by run, then probability
+        let quantiles = file.replace(".csv", "_quantiles.csv");
+        let (header, rows) = read_csv(&results.join(&quantiles));
+        assert_eq!(header, ["run", "probability", "delay_ns"], "{quantiles}");
+        let keys: Vec<(u32, f64)> = rows
+            .iter()
+            .map(|r| (r[0].parse().unwrap(), r[1].parse().unwrap()))
+            .collect();
+        let expected: Vec<(u32, f64)> = (0..RUNS)
+            .flat_map(|run| QUANTILE_PROBABILITIES.iter().map(move |&p| (run, p)))
+            .collect();
+        assert_eq!(keys, expected, "{quantiles}");
+        for (i, row) in rows.iter().enumerate() {
+            row[2]
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{quantiles} row {i}"));
         }
     }
 }
@@ -106,7 +134,7 @@ fn seeded_results_do_not_depend_on_the_worker_count() {
         ("driver-wdefault", None),
     ] {
         let other = run_sweep(name, &configs_json(), workers);
-        for file in FILES {
+        for file in ALL_FILES {
             let a = fs::read_to_string(reference.join(file)).unwrap();
             let b = fs::read_to_string(other.join(file)).unwrap();
             assert_eq!(a, b, "{file}: {name} differs from 1 worker");
@@ -120,9 +148,9 @@ fn invalid_max_concurrent_simulations_falls_back_to_the_default() {
     // and, being seeded, gives the same files as the default.
     let invalid = run_sweep("driver-invalid-env", &configs_json(), Some("not-a-number"));
     let default = run_sweep("driver-default-env", &configs_json(), None);
-    for file in FILES {
+    for file in ALL_FILES {
         let (_, rows) = read_csv(&invalid.join(file));
-        assert_eq!(rows.len(), RUNS as usize, "{file}");
+        assert!(!rows.is_empty(), "{file}");
         assert_eq!(
             fs::read_to_string(invalid.join(file)).unwrap(),
             fs::read_to_string(default.join(file)).unwrap(),

@@ -61,7 +61,7 @@ mod common;
 use common::{read_csv, run_sweep};
 use dpds_core::limiter::{Limiter, LimiterMode};
 use lib::config::Config;
-use lib::results::{CSV_HEADER, SimulationResults};
+use lib::results::{CSV_HEADER, QUANTILE_PROBABILITIES, SimulationResults};
 use lib::simulation::{Departure, run_simulation, run_simulation_traced};
 use lib::statistics::PassageTimeTracker;
 use serde_json::{Value, json};
@@ -367,6 +367,42 @@ fn binary_rows_equal_library_runs_with_seed_plus_run_index() {
         let (_, expected) = csv_row_of(&format!("e2e-{run}"), &r, run);
         assert_eq!(row, &expected, "run {run}");
     }
+}
+
+// ---------------------------------------------------------- delay quantiles
+
+#[test]
+fn quantiles_of_a_constant_delay_all_equal_the_delay() {
+    let cfg = scenario()
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .build();
+    let q = run_simulation(&cfg, 0).delay_quantiles_ns;
+    assert_eq!(q.len(), QUANTILE_PROBABILITIES.len());
+    for (p, &v) in QUANTILE_PROBABILITIES.iter().zip(&q) {
+        assert!((v as f64 - 1e6).abs() <= 1e3, "p = {p}: {v}");
+    }
+}
+
+#[test]
+fn quantiles_of_a_normal_delay_follow_the_configured_distribution() {
+    // Reordering on: a packet leaves at its own send time, so the achieved
+    // delay is the configured one (FIFO would add head-of-line blocking).
+    let cfg = scenario()
+        .with("duration_s", json!(0.1))
+        .reorder(true)
+        .delay("NormalDistribution", 10_000_000., 1_000_000.)
+        .build();
+    let q = run_simulation(&cfg, 0).delay_quantiles_ns;
+    assert_eq!(q.len(), QUANTILE_PROBABILITIES.len());
+    assert!(q.windows(2).all(|w| w[0] <= w[1]), "not non-decreasing");
+    let at = |p: f64| -> f64 {
+        let i = QUANTILE_PROBABILITIES.iter().position(|&x| x == p).unwrap();
+        q[i] as f64
+    };
+    assert!((at(0.5) - 10e6).abs() <= 0.01 * 10e6, "median {}", at(0.5));
+    // 10001 packets: the standard error of these quantiles is about 0.02 std
+    assert!((at(0.16) - 9e6).abs() <= 0.1e6, "mean - std: {}", at(0.16));
+    assert!((at(0.84) - 11e6).abs() <= 0.1e6, "mean + std: {}", at(0.84));
 }
 
 // ------------------------------------------------- smoke over the real sweep

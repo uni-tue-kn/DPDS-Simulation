@@ -5,6 +5,7 @@
 //! the theoretical passage-time mean and the limiter drop counter. `record_delay` takes just the delay
 //! (the measured passage-time tracker, which needed the time, is gone).
 
+use lib::results::QUANTILE_PROBABILITIES;
 use lib::statistics::{PassageTimeTracker, ReorderingMetric, SimulationStatistics};
 
 fn record_seqs(metric: ReorderingMetric, seqs: &[u64]) -> SimulationStatistics {
@@ -97,6 +98,7 @@ fn empty_statistics_have_zero_counts_and_no_division_by_zero() {
         let mut stats = SimulationStatistics::new(metric);
         let r = stats.get_results();
         assert_eq!(r.out_of_order_packets, 0);
+        assert_eq!(r.delay_quantiles_ns.len(), QUANTILE_PROBABILITIES.len());
         assert_eq!(r.kendall_tau_distance_div_n, 0.0);
         assert!(r.delay_mean_ns.is_finite());
         assert!(r.theoretical_passage_time_mean_ns.is_finite());
@@ -124,6 +126,32 @@ fn delays_are_rounded_to_whole_ns_before_recording() {
     stats.record_delay(100.6); // -> 101
     let r = stats.get_results();
     assert!((r.delay_mean_ns - 100.5).abs() < 1e-9);
+}
+
+// ------------------------------------------------------- delay quantiles
+
+#[test]
+fn quantile_probabilities_are_the_documented_ascending_grid() {
+    let mut expected = vec![0.001, 0.005];
+    expected.extend((1..=99).map(|k| f64::from(k) / 100.));
+    expected.extend([0.995, 0.999]);
+    assert_eq!(QUANTILE_PROBABILITIES.to_vec(), expected);
+    assert_eq!(QUANTILE_PROBABILITIES.len(), 103);
+}
+
+#[test]
+fn delay_quantiles_follow_the_probability_order_and_read_the_delay_histogram() {
+    // 1..=1000 ns are exact in the histogram: the p-quantile of the uniform
+    // sample is about 1000 p (a rank of one is allowed for the rounding).
+    let mut stats = SimulationStatistics::default();
+    for d in 1..=1000 {
+        stats.record_delay(f64::from(d));
+    }
+    let q = stats.get_results().delay_quantiles_ns;
+    assert_eq!(q.len(), QUANTILE_PROBABILITIES.len());
+    for (p, &v) in QUANTILE_PROBABILITIES.iter().zip(&q) {
+        assert!((v as f64 - 1000. * p).abs() <= 1.5, "p = {p}: {v}");
+    }
 }
 
 // ------------------------------------------------------- passage-time tracker

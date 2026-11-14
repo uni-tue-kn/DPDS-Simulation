@@ -74,7 +74,8 @@ Rules:
 ## Running a simulation
 
 The simulation reads its workload from `simulation_configs.json` in the working
-directory and writes one CSV per configuration into `results/`:
+directory and writes two CSVs per configuration into `results/` (the result CSV
+and its [quantile file](#delay-quantiles)):
 
 ```sh
 cargo run --release --bin dpds_simulation
@@ -95,6 +96,19 @@ instead of all runs of a few. A config's CSV is written (atomically, from the
 rows of the checkpoint) once all of its runs have finished, with the rows sorted
 by run index. With a `seed` set, the files are byte-identical for any worker
 count and for any order or interruption of the runs.
+
+### Delay quantiles
+
+Next to each result CSV `<stem>.csv` the sweep writes `<stem>_quantiles.csv`
+(header `run,probability,delay_ns`), at the same moment and with the same atomic
+write. It holds one row per (run, probability), sorted by run and then by
+probability, with the empirical quantiles of the **achieved** delay (send time
+minus arrival time at the departure, the same delay as `delay_mean_ns`) in ns.
+The probabilities are 0.001, 0.005, 0.01 to 0.99 in steps of 0.01, 0.995 and
+0.999 (103 rows per run). The values come from an HDR histogram with 3
+significant figures, so they are accurate to about 0.1 %. Plotting them against
+the quantiles of the configured delay distribution gives a QQ plot; plotting
+the configured CDF at them against the probability gives a PP plot.
 
 ### Options
 
@@ -127,10 +141,11 @@ atomically (temporary file in the same directory, fsync, rename), so even a
 fingerprint of the parsed `simulation_configs.json` (every field that affects
 the results, but not its whitespace or key order; `runs` and `csv_output_path`
 included), and per config (keyed by `csv_output_path`) the set of completed run
-indices with their CSV rows. A resumed sweep skips exactly the recorded runs
-and rebuilds the CSVs from the recorded rows. At the end of a complete sweep
-the checkpoint is removed. To rerun a single run, delete its entry from the
-file by hand.
+indices with their CSV rows and delay quantiles (format version 2). A resumed
+sweep skips exactly the recorded runs and rebuilds both CSVs from the recorded
+data. At the end of a complete sweep
+the checkpoint is removed. To rerun a single run, delete its entries (under
+`rows` and under `quantiles`) from the file by hand.
 
 When a checkpoint exists at start-up, a summary is printed (completed/total
 runs, age) and:

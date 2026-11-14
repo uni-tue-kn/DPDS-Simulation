@@ -1,4 +1,4 @@
-use crate::results::SimulationResults;
+use crate::results::{QUANTILE_PROBABILITIES, SimulationResults};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
@@ -406,6 +406,10 @@ impl SimulationStatistics {
             theoretical_passage_time_mean_ns: self.theoretical_passage_time_ns.mean(),
             dropped_packets_limiter: self.dropped_packets_limiter,
             dropped_packets_buffer_full: self.dropped_packets_buffer_full,
+            delay_quantiles_ns: QUANTILE_PROBABILITIES
+                .iter()
+                .map(|&p| self.delay_ns.value_at_quantile(p))
+                .collect(),
         }
     }
 }

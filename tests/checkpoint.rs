@@ -9,7 +9,7 @@
 //! ```text
 //! lib::checkpoint                      // new module, `pub mod checkpoint;` in lib.rs
 //!   pub const FORMAT: &str = "dpds-simulation-checkpoint";
-//!   pub const VERSION: u32 = 1;
+//!   pub const VERSION: u32 = 2;   // 2: runs also store their delay quantiles
 //!   pub const FILE_NAME: &str = ".checkpoint.json";   // lives in `results/`
 //!
 //!   #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,11 +26,14 @@
 //!       pub rows: BTreeMap<u32, Vec<String>>,    // completed run index -> its
 //!                                                // CSV row (the CSV_HEADER.len() strings of
 //!                                                // SimulationResults::csv_record)
+//!       pub quantiles: BTreeMap<u32, Vec<u64>>,  // completed run index -> its
+//!                                                // SimulationResults::delay_quantiles_ns
 //!   }
 //!   impl Checkpoint {
 //!       pub fn new(configs: &[Config]) -> Checkpoint;    // nothing completed yet,
 //!                                                        // one entry per config
-//!       pub fn record(&mut self, csv_output_path: &str, run: u32, row: Vec<String>);
+//!       pub fn record(&mut self, csv_output_path: &str, run: u32, row: Vec<String>,
+//!                     quantiles: Vec<u64>);
 //!       pub fn completed_runs(&self, csv_output_path: &str) -> BTreeSet<u32>;
 //!   }
 //!   pub fn fingerprint(configs: &[Config]) -> String;
@@ -56,14 +59,15 @@
 //! JSON shape of the file (pinned by `saved_json_has_the_documented_shape`):
 //!
 //! ```json
-//! {"format": "dpds-simulation-checkpoint", "version": 1,
+//! {"format": "dpds-simulation-checkpoint", "version": 2,
 //!  "fingerprint": "<opaque string>", "updated_unix_s": 1700000000,
-//!  "configs": {"<csv_output_path>": {"runs": 6, "rows": {"0": ["0", "..."], "3": ["3", "..."]}}}}
+//!  "configs": {"<csv_output_path>": {"runs": 6, "rows": {"0": ["0", "..."], "3": ["3", "..."]},
+//!                                      "quantiles": {"0": [9990000, "..."], "3": [9980000, "..."]}}}}
 //! ```
 
 use lib::checkpoint::{self, Checkpoint, ConfigProgress, fingerprint};
 use lib::config::Config;
-use lib::results::CSV_HEADER;
+use lib::results::{CSV_HEADER, QUANTILE_PROBABILITIES};
 use lib::simulation::run_simulation;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -136,6 +140,13 @@ fn row(run: u32) -> Vec<String> {
     row
 }
 
+/// Distinct, run-dependent quantiles (one per probability).
+fn quantiles(run: u32) -> Vec<u64> {
+    (0..QUANTILE_PROBABILITIES.len() as u64)
+        .map(|i| u64::from(run) * 1000 + i)
+        .collect()
+}
+
 fn set(runs: &[u32]) -> BTreeSet<u32> {
     runs.iter().copied().collect()
 }
@@ -144,7 +155,7 @@ fn checkpoint_with(configs: &[Config], completed: &[(&str, &[u32])]) -> Checkpoi
     let mut cp = Checkpoint::new(configs);
     for (csv, runs) in completed {
         for &run in *runs {
-            cp.record(csv, run, row(run));
+            cp.record(csv, run, row(run), quantiles(run));
         }
     }
     cp
@@ -172,7 +183,7 @@ fn new_checkpoint_has_format_version_fingerprint_and_nothing_completed() {
     let cp = Checkpoint::new(&configs);
     assert_eq!(cp.format, "dpds-simulation-checkpoint");
     assert_eq!(cp.format, checkpoint::FORMAT);
-    assert_eq!(cp.version, 1);
+    assert_eq!(cp.version, 2);
     assert_eq!(cp.version, checkpoint::VERSION);
     assert_eq!(cp.fingerprint, fingerprint(&configs));
     assert_eq!(checkpoint::FILE_NAME, ".checkpoint.json");
@@ -192,12 +203,13 @@ fn record_collects_the_set_of_completed_run_indices() {
     let mut cp = Checkpoint::new(&configs);
     // completion order is not index order
     for run in [4, 0, 2] {
-        cp.record("a.csv", run, row(run));
+        cp.record("a.csv", run, row(run), quantiles(run));
     }
-    cp.record("b.csv", 3, row(3));
+    cp.record("b.csv", 3, row(3), quantiles(3));
     assert_eq!(cp.completed_runs("a.csv"), set(&[0, 2, 4]));
     assert_eq!(cp.completed_runs("b.csv"), set(&[3]));
     assert_eq!(cp.configs["a.csv"].rows[&2], row(2));
+    assert_eq!(cp.configs["a.csv"].quantiles[&2], quantiles(2));
 }
 
 #[test]
@@ -222,7 +234,7 @@ fn saved_json_has_the_documented_shape() {
         ]
     );
     assert_eq!(value["format"], "dpds-simulation-checkpoint");
-    assert_eq!(value["version"], 1);
+    assert_eq!(value["version"], 2);
     assert!(value["fingerprint"].as_str().is_some_and(|s| !s.is_empty()));
     assert!(value["updated_unix_s"].is_u64());
 
@@ -324,9 +336,15 @@ fn round_trip_with_the_real_rows_including_nan_and_infinite_values() {
     let configs = parse(vec![value]);
     let mut cp = Checkpoint::new(&configs);
     for run in 0..2 {
-        let row = run_simulation(&configs[0], run).csv_record(run).to_vec();
+        let results = run_simulation(&configs[0], run);
+        let row = results.csv_record(run).to_vec();
         assert_eq!(row.len(), CSV_HEADER.len());
-        cp.record("nan.csv", run, row);
+        // even with no departed packet there is one value per probability
+        assert_eq!(
+            results.delay_quantiles_ns.len(),
+            QUANTILE_PROBABILITIES.len()
+        );
+        cp.record("nan.csv", run, row, results.delay_quantiles_ns);
     }
     assert_round_trip("real-rows", &cp);
 }
@@ -361,10 +379,12 @@ fn loader_accepts_hand_edited_files() {
     // (the documented way to rerun a single run).
     let dir = Dir::new("hand-edit");
     let mut value = valid_json();
-    value["configs"]["a.csv"]["rows"]
-        .as_object_mut()
-        .unwrap()
-        .remove("0");
+    for key in ["rows", "quantiles"] {
+        value["configs"]["a.csv"][key]
+            .as_object_mut()
+            .unwrap()
+            .remove("0");
+    }
     write_json(&dir, &value);
     let cp = checkpoint::load(&dir.file()).unwrap();
     assert_eq!(cp.completed_runs("a.csv"), set(&[2]));
@@ -506,12 +526,13 @@ fn loader_rejects_missing_fields() {
 fn loader_rejects_another_format_or_version() {
     rejected_mutation("other-format", |v| v["format"] = json!("something-else"));
     rejected_mutation("empty-format", |v| v["format"] = json!(""));
-    for version in [0, 2, 3, 99] {
+    // 1 is the previous format (without quantiles): no migration
+    for version in [0, 1, 3, 99] {
         rejected_mutation(&format!("version-{version}"), |v| {
             v["version"] = json!(version);
         });
     }
-    rejected_mutation("version-string", |v| v["version"] = json!("1"));
+    rejected_mutation("version-string", |v| v["version"] = json!("2"));
 }
 
 #[test]
@@ -519,6 +540,16 @@ fn loader_rejects_run_indices_at_or_above_the_run_count() {
     // a.csv has 6 runs: index 6 is out of range, 5 is the highest valid one
     rejected_mutation("index-at-runs", |v| {
         v["configs"]["a.csv"]["rows"]["6"] = json!(row(6));
+    });
+    // a run needs both its row and its full set of quantiles
+    rejected_mutation("row-without-quantiles", |v| {
+        v["configs"]["a.csv"]["rows"]["5"] = json!(row(5));
+    });
+    rejected_mutation("too-few-quantiles", |v| {
+        let run = v["configs"]["a.csv"]["quantiles"]["2"]
+            .as_array_mut()
+            .unwrap();
+        run.pop();
     });
     rejected_mutation("index-far-above", |v| {
         v["configs"]["b.csv"]["rows"]["400"] = json!(row(0));
@@ -536,6 +567,7 @@ fn loader_rejects_run_indices_at_or_above_the_run_count() {
     let dir = Dir::new("index-highest-ok");
     let mut value = valid_json();
     value["configs"]["a.csv"]["rows"]["5"] = json!(row(5));
+    value["configs"]["a.csv"]["quantiles"]["5"] = json!(quantiles(5));
     write_json(&dir, &value);
     assert!(
         checkpoint::load(&dir.file()).unwrap().configs["a.csv"]
@@ -737,6 +769,7 @@ fn config_progress_is_a_plain_data_struct() {
     let progress = ConfigProgress {
         runs: 2,
         rows: [(1, row(1))].into_iter().collect(),
+        quantiles: [(1, quantiles(1))].into_iter().collect(),
     };
     assert_eq!(progress.rows.len(), 1);
     assert_eq!(

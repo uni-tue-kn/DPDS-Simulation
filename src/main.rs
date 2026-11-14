@@ -6,7 +6,7 @@ use lib::{
     affinity,
     checkpoint::{self, Checkpoint, ConfigProgress},
     config::Config,
-    results::csv_bytes,
+    results::{csv_bytes, quantiles_csv_bytes},
     simulation::{arrivals_per_run, run_simulation},
 };
 
@@ -354,10 +354,11 @@ impl Sweep<'_> {
             self.progress.set_message(job.clone());
 
             CURRENT_JOB.with(|current| *current.borrow_mut() = Some(job));
-            let row = run_simulation(config, run).csv_record(run).to_vec();
+            let results = run_simulation(config, run);
+            let row = results.csv_record(run).to_vec();
             CURRENT_JOB.with(|current| *current.borrow_mut() = None);
 
-            self.complete(csv, run, row);
+            self.complete(csv, run, row, results.delay_quantiles_ns);
             self.progress.inc(1);
         }
     }
@@ -384,12 +385,12 @@ the runs in flight to finish and be checkpointed."
 
     /// Records the run, saves the checkpoint and, if the config is now
     /// complete, writes its CSV.
-    fn complete(&self, csv: &str, run: u32, row: Vec<String>) {
+    fn complete(&self, csv: &str, run: u32, row: Vec<String>, quantiles: Vec<u64>) {
         let mut checkpoint = self
             .checkpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        checkpoint.record(csv, run, row);
+        checkpoint.record(csv, run, row, quantiles);
         let path = checkpoint_path();
         checkpoint::save(&path, &checkpoint)
             .unwrap_or_else(|e| fail(&format!("cannot save {}: {e}", path.display())));
@@ -399,11 +400,19 @@ the runs in flight to finish and be checkpointed."
     }
 }
 
-/// Writes the CSV of a config from its checkpointed rows (sorted by run). A
-/// failure ends the process with an error message (runs are checkpointed).
+/// Writes the result CSV and the `<stem>_quantiles.csv` of a config from its
+/// checkpointed runs (sorted by run). A failure ends the process with an error
+/// message (runs are checkpointed).
 fn write_csv(csv: &str, progress: &ConfigProgress) {
     let path = Path::new(RESULT_DIR).join(csv);
     let bytes = csv_bytes(progress.rows.values())
+        .unwrap_or_else(|e| fail(&format!("cannot build {}: {e}", path.display())));
+    checkpoint::write_atomic(&path, &bytes)
+        .unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", path.display())));
+
+    let quantiles_name = format!("{}_quantiles.csv", csv.strip_suffix(".csv").unwrap_or(csv));
+    let path = Path::new(RESULT_DIR).join(quantiles_name);
+    let bytes = quantiles_csv_bytes(&progress.quantiles)
         .unwrap_or_else(|e| fail(&format!("cannot build {}: {e}", path.display())));
     checkpoint::write_atomic(&path, &bytes)
         .unwrap_or_else(|e| fail(&format!("cannot write {}: {e}", path.display())));

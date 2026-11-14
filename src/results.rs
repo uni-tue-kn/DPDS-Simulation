@@ -15,6 +15,26 @@ pub const CSV_HEADER: [&str; 8] = [
     "dropped_packets_buffer_full",
 ];
 
+/// Column names of the per-config quantile CSVs.
+pub const QUANTILE_CSV_HEADER: [&str; 3] = ["run", "probability", "delay_ns"];
+
+/// Probabilities at which the achieved delay is reported: 0.001, 0.005,
+/// 0.01 to 0.99 in steps of 0.01, 0.995 and 0.999.
+pub const QUANTILE_PROBABILITIES: [f64; 103] = {
+    let mut p = [0.0; 103];
+    p[0] = 0.001;
+    p[1] = 0.005;
+    let mut k = 1;
+    while k <= 99 {
+        // A single correctly rounded division prints as `0.07`, not `0.07000000000000001`.
+        p[k + 1] = k as f64 / 100.0;
+        k += 1;
+    }
+    p[101] = 0.995;
+    p[102] = 0.999;
+    p
+};
+
 #[derive(Debug, Clone)]
 pub struct SimulationResults {
     pub delay_mean_ns: f64,
@@ -24,6 +44,9 @@ pub struct SimulationResults {
     pub theoretical_passage_time_mean_ns: f64,
     pub dropped_packets_limiter: u64,
     pub dropped_packets_buffer_full: u64,
+    /// The achieved delay at each of [`QUANTILE_PROBABILITIES`], in ns (the
+    /// delay histogram has 3 significant figures).
+    pub delay_quantiles_ns: Vec<u64>,
 }
 
 impl SimulationResults {
@@ -62,6 +85,25 @@ pub fn csv_bytes<'a>(
     writer.write_record(CSV_HEADER)?;
     for row in rows {
         writer.write_record(row)?;
+    }
+    Ok(writer.into_inner()?)
+}
+
+/// The text of a complete quantile CSV: one row per (run, probability), in the
+/// order of the given runs and of [`QUANTILE_PROBABILITIES`].
+pub fn quantiles_csv_bytes<'a>(
+    runs: impl IntoIterator<Item = (&'a u32, &'a Vec<u64>)>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut writer = Writer::from_writer(Vec::new());
+    writer.write_record(QUANTILE_CSV_HEADER)?;
+    for (run, quantiles) in runs {
+        for (probability, delay_ns) in QUANTILE_PROBABILITIES.iter().zip(quantiles) {
+            writer.write_record([
+                run.to_string(),
+                probability.to_string(),
+                delay_ns.to_string(),
+            ])?;
+        }
     }
     Ok(writer.into_inner()?)
 }

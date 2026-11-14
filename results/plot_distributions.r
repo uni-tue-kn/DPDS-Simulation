@@ -339,7 +339,148 @@ ggsave(
 cat("\nPlot saved as: distributions_passage_time.pdf\n")
 
 ##################################################################################################
-# Plot 4: Sampling cost per distribution (benchmark_sampling.csv)
+# Plots 4 and 5: QQ and PP plot of the configured ("incoming") delay distribution against the
+# achieved ("outgoing") delay, from <stem>_quantiles.csv (run, probability, delay_ns).
+# Each file holds the empirical quantiles of the achieved delay per run; they are averaged over
+# the runs per probability.
+
+# The configured distribution, parameterised exactly as dpds-core does from the mean and the
+# standard deviation (crates/dpds-core/src/delayer.rs, Delayer::initialize_rv; rand_distr 0.6):
+#   Normal(mean, std)             -> qnorm / pnorm
+#   LogNormal::from_mean_cv(mean, cv = std / mean)
+#                                 -> sdlog^2 = ln(1 + cv^2), meanlog = ln(mean) - sdlog^2 / 2
+#   Gamma(shape = alpha, scale = beta) with alpha = (mean / std)^2, beta = std^2 / mean
+#                                 -> shape = alpha, scale = beta (a scale, not a rate)
+#   Uniform(mean -+ sqrt(3) * std) -> qunif / punif
+# The delayer clamps negative samples to 0 (Delayer::next_delay), hence max(0, .) for the Normal.
+# The CDF is evaluated at the (non-negative) empirical quantiles, so the clamp does not change it.
+mean_ms <- as.numeric(sub("ms", "", delays[1]))
+std_ms <- as.numeric(sub("us", "", jitters[1])) / 1000
+ln_sdlog <- sqrt(log(1 + (std_ms / mean_ms)^2))
+ln_meanlog <- log(mean_ms) - ln_sdlog^2 / 2
+gamma_shape <- (mean_ms / std_ms)^2
+gamma_scale <- std_ms^2 / mean_ms
+uniform_low <- mean_ms - sqrt(3) * std_ms
+uniform_high <- mean_ms + sqrt(3) * std_ms
+
+df_quantiles <- data.frame()
+for (prefix in prefixes) {
+    for (distribution in distributions) {
+        for (delay in delays) {
+            for (jitter in jitters) {
+                for (rate in rates) {
+                    filename <- paste0(prefix, "_", distribution, "_", delay, "_", jitter, "_", rate, "_quantiles.csv")
+                    if (file.exists(filename)) {
+                        data <- read.csv(filename) %>%
+                            group_by(probability) %>%
+                            summarise(delay_ms = mean(delay_ns) / 1e6, .groups = "drop")
+                        data$distribution <- distribution
+                        data$rate_config <- rate
+                        df_quantiles <- rbind(df_quantiles, data)
+                    } else {
+                        warning(paste("File not found:", filename))
+                    }
+                }
+            }
+        }
+    }
+}
+
+if (nrow(df_quantiles) > 0) {
+    p <- df_quantiles$probability
+    x <- df_quantiles$delay_ms
+    d <- df_quantiles$distribution
+    df_quantiles <- df_quantiles %>%
+        mutate(
+            theoretical_ms = case_when(
+                d == "normal" ~ pmax(0, qnorm(p, mean_ms, std_ms)),
+                d == "uniform" ~ qunif(p, uniform_low, uniform_high),
+                d == "gamma" ~ qgamma(p, shape = gamma_shape, scale = gamma_scale),
+                d == "lognormal" ~ qlnorm(p, ln_meanlog, ln_sdlog)
+            ),
+            theoretical_cdf = case_when(
+                d == "normal" ~ pnorm(x, mean_ms, std_ms),
+                d == "uniform" ~ punif(x, uniform_low, uniform_high),
+                d == "gamma" ~ pgamma(x, shape = gamma_shape, scale = gamma_scale),
+                d == "lognormal" ~ plnorm(x, ln_meanlog, ln_sdlog)
+            ),
+            distribution = factor(distribution,
+                levels = c("normal", "uniform", "gamma", "lognormal"),
+                labels = c("Normal", "Uniform", "Gamma", "Log-normal")
+            ),
+            rate_config = factor(rate_config,
+                levels = c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps"),
+                labels = c("0.1", "1", "10", "100")
+            )
+        )
+
+    rate_colors <- c(
+        "0.1" = "#000000",
+        "1" = "#0072B2",
+        "10" = "#D55E00",
+        "100" = "#E69F00"
+    )
+
+    facet_theme <- theme(
+        strip.text = element_text(size = font_size, face = "bold"),
+        strip.clip = "off",
+        panel.spacing.x = unit(1.5, "lines")
+    )
+
+    # Plot 4: QQ plot (theoretical quantile on x, achieved quantile on y)
+    plot_qq <- ggplot(df_quantiles, aes(x = theoretical_ms, y = delay_ms, color = rate_config)) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+        geom_point(size = point_size / 3) +
+        facet_wrap(~distribution, nrow = 1) +
+        scale_x_continuous(breaks = c(0, 10, 20)) +
+        scale_color_manual(values = rate_colors) +
+        base_theme +
+        legend_theme +
+        facet_theme +
+        guides(color = guide_legend(override.aes = list(size = point_size))) +
+        labs(
+            x = "Configured delay quantile (ms)",
+            y = "Achieved delay\nquantile (ms)",
+            color = "Rate (Gbit/s)"
+        )
+
+    ggsave(
+        file = "distributions_qq.pdf",
+        plot = plot_qq,
+        device = cairo_pdf,
+        width = 14.4, height = 6
+    )
+    cat("\nPlot saved as: distributions_qq.pdf\n")
+
+    # Plot 5: PP plot (configured CDF at the achieved quantile on x, probability on y)
+    plot_pp <- ggplot(df_quantiles, aes(x = theoretical_cdf, y = probability, color = rate_config)) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+        geom_point(size = point_size / 3) +
+        facet_wrap(~distribution, nrow = 1) +
+        scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+        scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+        scale_color_manual(values = rate_colors) +
+        base_theme +
+        legend_theme +
+        facet_theme +
+        guides(color = guide_legend(override.aes = list(size = point_size))) +
+        labs(
+            x = "Configured CDF at\nachieved quantile",
+            y = "Probability",
+            color = "Rate (Gbit/s)"
+        )
+
+    ggsave(
+        file = "distributions_pp.pdf",
+        plot = plot_pp,
+        device = cairo_pdf,
+        width = 14.4, height = 6
+    )
+    cat("\nPlot saved as: distributions_pp.pdf\n")
+}
+
+##################################################################################################
+# Plot 6: Sampling cost per distribution (benchmark_sampling.csv)
 # How long (real wall-clock time) it takes to generate a single sample, with 95%
 # confidence intervals across the repeated benchmark runs.
 

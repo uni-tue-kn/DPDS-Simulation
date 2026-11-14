@@ -459,19 +459,30 @@ fn slow_text() -> String {
     ])
 }
 
-/// The genuine CSV rows (as strings, by run index) of every config, computed
-/// with the library, one thread per config.
-fn genuine_rows(configs: &[Config]) -> BTreeMap<String, Vec<Vec<String>>> {
+/// What a run leaves in the checkpoint: its CSV row and its delay quantiles.
+#[derive(Clone)]
+struct RunData {
+    row: Vec<String>,
+    quantiles: Vec<u64>,
+}
+
+type Genuine = BTreeMap<String, Vec<RunData>>;
+
+/// The genuine data (by run index) of every config, computed with the
+/// library, one thread per config.
+fn genuine_rows(configs: &[Config]) -> Genuine {
     thread::scope(|scope| {
         let handles: Vec<_> = configs
             .iter()
             .map(|config| {
                 scope.spawn(move || {
-                    let rows: Vec<Vec<String>> = (0..config.simulation_config.runs)
+                    let rows: Vec<RunData> = (0..config.simulation_config.runs)
                         .map(|run| {
-                            lib::simulation::run_simulation(config, run)
-                                .csv_record(run)
-                                .to_vec()
+                            let results = lib::simulation::run_simulation(config, run);
+                            RunData {
+                                row: results.csv_record(run).to_vec(),
+                                quantiles: results.delay_quantiles_ns,
+                            }
                         })
                         .collect();
                     (config.simulation_config.csv_output_path.clone(), rows)
@@ -482,8 +493,8 @@ fn genuine_rows(configs: &[Config]) -> BTreeMap<String, Vec<Vec<String>>> {
     })
 }
 
-fn slow_rows() -> &'static BTreeMap<String, Vec<Vec<String>>> {
-    static ROWS: OnceLock<BTreeMap<String, Vec<Vec<String>>>> = OnceLock::new();
+fn slow_rows() -> &'static Genuine {
+    static ROWS: OnceLock<Genuine> = OnceLock::new();
     ROWS.get_or_init(|| genuine_rows(&parse(&slow_text())))
 }
 
@@ -492,10 +503,33 @@ const SENTINEL: &str = "7770000";
 /// What a checkpoint stores for a run in the tests that plant rows: the
 /// genuine row with a recognisable value in column 1. A resumed sweep that
 /// re-ran the run would overwrite it with the genuine value.
-fn sentinel_row(genuine: &[String]) -> Vec<String> {
-    let mut row = genuine.to_vec();
+fn sentinel_row(genuine: &RunData) -> RunData {
+    let mut row = genuine.row.clone();
     row[1] = SENTINEL.to_string();
-    row
+    RunData {
+        row,
+        quantiles: vec![SENTINEL.parse().unwrap(); genuine.quantiles.len()],
+    }
+}
+
+/// The quantile file next to a result CSV: `<stem>_quantiles.csv`.
+fn quantiles_name(csv: &str) -> String {
+    format!("{}_quantiles.csv", csv.strip_suffix(".csv").unwrap())
+}
+
+/// The text of a quantile file: one row per (run, probability), by run.
+fn quantiles_text(runs: &[RunData]) -> String {
+    let rows: Vec<Vec<String>> = runs
+        .iter()
+        .enumerate()
+        .flat_map(|(run, data)| {
+            lib::results::QUANTILE_PROBABILITIES
+                .iter()
+                .zip(&data.quantiles)
+                .map(move |(p, v)| vec![run.to_string(), p.to_string(), v.to_string()])
+        })
+        .collect();
+    csv_text(&["run", "probability", "delay_ns"], &rows)
 }
 
 fn csv_text(header: &[&str], rows: &[Vec<String>]) -> String {
@@ -507,37 +541,39 @@ fn csv_text(header: &[&str], rows: &[Vec<String>]) -> String {
     String::from_utf8(writer.into_inner().unwrap()).unwrap()
 }
 
-/// Expected CSV text per config when the runs in `planted` come from the
-/// checkpoint (sentinel rows) and all others were executed.
-fn expected_csvs(
-    rows: &BTreeMap<String, Vec<Vec<String>>>,
-    planted: &[(&str, &[u32])],
-) -> BTreeMap<String, String> {
+/// Expected file text per result CSV and per quantile file of every config
+/// when the runs in `planted` come from the checkpoint (sentinel data) and
+/// all others were executed.
+fn expected_csvs(rows: &Genuine, planted: &[(&str, &[u32])]) -> BTreeMap<String, String> {
     rows.iter()
-        .map(|(csv, genuine)| {
+        .flat_map(|(csv, genuine)| {
             let planted_runs: BTreeSet<u32> = planted
                 .iter()
                 .filter(|(name, _)| name == csv)
                 .flat_map(|(_, runs)| runs.iter().copied())
                 .collect();
-            let rows: Vec<Vec<String>> = genuine
+            let runs: Vec<RunData> = genuine
                 .iter()
                 .enumerate()
-                .map(|(run, row)| {
+                .map(|(run, data)| {
                     if planted_runs.contains(&(run as u32)) {
-                        sentinel_row(row)
+                        sentinel_row(data)
                     } else {
-                        row.clone()
+                        data.clone()
                     }
                 })
                 .collect();
-            (csv.clone(), csv_text(&lib::results::CSV_HEADER, &rows))
+            let rows: Vec<Vec<String>> = runs.iter().map(|r| r.row.clone()).collect();
+            [
+                (csv.clone(), csv_text(&lib::results::CSV_HEADER, &rows)),
+                (quantiles_name(csv), quantiles_text(&runs)),
+            ]
         })
         .collect()
 }
 
-/// Asserts that `results/` holds exactly these CSVs with exactly this text
-/// and nothing else (no checkpoint, no temp files).
+/// Asserts that `results/` holds exactly these CSVs (results and quantiles)
+/// with exactly this text and nothing else (no checkpoint, no temp files).
 fn assert_results_are(scratch: &Scratch, expected: &BTreeMap<String, String>) {
     for (csv, text) in expected {
         let actual = fs::read_to_string(scratch.results().join(csv))
@@ -557,14 +593,15 @@ fn assert_results_are(scratch: &Scratch, expected: &BTreeMap<String, String>) {
 fn plant_checkpoint(
     scratch: &Scratch,
     configs: &[Config],
-    genuine: &BTreeMap<String, Vec<Vec<String>>>,
+    genuine: &Genuine,
     completed: &[(&str, &[u32])],
 ) -> Vec<u8> {
     fs::create_dir_all(scratch.results()).unwrap();
     let mut cp = Checkpoint::new(configs);
     for (csv, runs) in completed {
         for &run in *runs {
-            cp.record(csv, run, sentinel_row(&genuine[*csv][run as usize]));
+            let data = sentinel_row(&genuine[*csv][run as usize]);
+            cp.record(csv, run, data.row, data.quantiles);
         }
     }
     checkpoint::save(&scratch.checkpoint_path(), &cp).unwrap();
@@ -578,7 +615,7 @@ const PLANTED: [(&str, &[u32]); 2] = [("a_fifo.csv", &[0, 2, 5]), ("b_reorder.cs
 struct Small {
     scratch: Scratch,
     configs: Vec<Config>,
-    genuine: BTreeMap<String, Vec<Vec<String>>>,
+    genuine: Genuine,
 }
 
 impl Small {
@@ -662,11 +699,18 @@ fn wait_for_checkpoint(
     }
 }
 
-fn assert_recorded_rows_are_genuine(cp: &Checkpoint, genuine: &BTreeMap<String, Vec<Vec<String>>>) {
+fn assert_recorded_rows_are_genuine(cp: &Checkpoint, genuine: &Genuine) {
     for (csv, progress) in &cp.configs {
         for (run, row) in &progress.rows {
-            assert_eq!(row, &genuine[csv][*run as usize], "{csv} run {run}");
+            let expected = &genuine[csv][*run as usize];
+            assert_eq!(row, &expected.row, "{csv} run {run}");
+            assert_eq!(
+                progress.quantiles.get(run),
+                Some(&expected.quantiles),
+                "{csv} run {run}: quantiles"
+            );
         }
+        assert_eq!(progress.rows.len(), progress.quantiles.len(), "{csv}");
     }
 }
 
@@ -716,7 +760,7 @@ fn checkpoint_is_saved_after_every_run_not_only_on_exit() {
     let cp = checkpoint::load(&scratch.checkpoint_path())
         .expect("a SIGKILL must leave a valid checkpoint (atomic writes)");
     assert_eq!(cp.format, "dpds-simulation-checkpoint");
-    assert_eq!(cp.version, 1);
+    assert_eq!(cp.version, 2);
     assert_eq!(
         cp.fingerprint,
         fingerprint(&configs),
@@ -744,11 +788,12 @@ fn checkpoint_is_saved_after_every_run_not_only_on_exit() {
     }
     assert_recorded_rows_are_genuine(&cp, slow_rows());
     // a CSV may only exist for a config that is complete in the checkpoint
-    for csv in scratch.csv_files() {
+    for file in scratch.csv_files() {
+        let csv = file.replace("_quantiles.csv", ".csv");
         assert_eq!(
             cp.configs[&csv].rows.len() as u32,
             cp.configs[&csv].runs,
-            "{csv}"
+            "{file}"
         );
     }
 
@@ -802,6 +847,11 @@ fn resume_writes_the_csv_of_a_config_that_is_complete_in_the_checkpoint() {
     let planted: [(&str, &[u32]); 1] = [("a_fifo.csv", &[0, 1, 2, 3, 4, 5])];
     plant_checkpoint(&small.scratch, &small.configs, &small.genuine, &planted);
     fs::write(small.scratch.results().join("a_fifo.csv"), "stale\n").unwrap();
+    fs::write(
+        small.scratch.results().join("a_fifo_quantiles.csv"),
+        "stale\n",
+    )
+    .unwrap();
     let outcome = run(&small.scratch, &["--resume"], &[], None);
     assert_success(&outcome);
     assert_results_are(&small.scratch, &expected_csvs(&small.genuine, &planted));
@@ -821,10 +871,16 @@ fn resume_of_an_already_complete_checkpoint_runs_nothing() {
     let outcome = run(&small.scratch, &["--resume"], &[], None);
     assert_success(&outcome);
     let expected = expected_csvs(&small.genuine, &planted);
+    let quantiles_per_run = lib::results::QUANTILE_PROBABILITIES.len();
     assert!(
-        expected
-            .values()
-            .all(|text| text.matches(SENTINEL).count() == SMALL_RUNS as usize),
+        expected.iter().all(|(file, text)| {
+            let per_run = if file.ends_with("_quantiles.csv") {
+                quantiles_per_run
+            } else {
+                1
+            };
+            text.matches(SENTINEL).count() == SMALL_RUNS as usize * per_run
+        }),
         "oracle: every row is a sentinel"
     );
     assert_results_are(&small.scratch, &expected);
@@ -1115,7 +1171,8 @@ fn corrupt_checkpoints_abort_for_every_kind_of_damage() {
         ("garbage", b"definitely not json".to_vec()),
         ("empty file", Vec::new()),
         ("truncated", good[..good.len() / 2].to_vec()),
-        ("wrong version", mutated(&|v| v["version"] = json!(2))),
+        // version 1 is the format before the quantiles; no migration
+        ("old version", mutated(&|v| v["version"] = json!(1))),
         ("version zero", mutated(&|v| v["version"] = json!(0))),
         (
             "other format",
@@ -1159,7 +1216,8 @@ fn plant_edited_checkpoint(small: &Small, edit: impl FnOnce(&mut Checkpoint)) ->
     let mut cp = Checkpoint::new(&small.configs);
     for (csv, runs) in PLANTED {
         for &run in runs {
-            cp.record(csv, run, sentinel_row(&small.genuine[csv][run as usize]));
+            let data = sentinel_row(&small.genuine[csv][run as usize]);
+            cp.record(csv, run, data.row, data.quantiles);
         }
     }
     edit(&mut cp);
@@ -1183,6 +1241,7 @@ fn a_checkpoint_with_other_config_keys_than_the_configs_aborts_cleanly() {
             let extra = ConfigProgress {
                 runs: 3,
                 rows: BTreeMap::new(),
+                quantiles: BTreeMap::new(),
             };
             cp.configs.insert("extra.csv".to_string(), extra);
         }),
@@ -1221,7 +1280,7 @@ fn a_row_whose_first_field_is_not_its_run_index_aborts_cleanly() {
     type Edit = fn(&mut Checkpoint, &Small);
     let cases: [(&str, Edit); 3] = [
         ("run 2's row under index 0", |cp, small| {
-            let row = small.genuine["a_fifo.csv"][2].clone();
+            let row = small.genuine["a_fifo.csv"][2].row.clone();
             cp.configs
                 .get_mut("a_fifo.csv")
                 .unwrap()
@@ -1229,7 +1288,7 @@ fn a_row_whose_first_field_is_not_its_run_index_aborts_cleanly() {
                 .insert(0, row);
         }),
         ("first field is another run", |cp, small| {
-            let mut row = small.genuine["b_reorder.csv"][1].clone();
+            let mut row = small.genuine["b_reorder.csv"][1].row.clone();
             row[0] = "7".to_string();
             cp.configs
                 .get_mut("b_reorder.csv")
@@ -1238,7 +1297,7 @@ fn a_row_whose_first_field_is_not_its_run_index_aborts_cleanly() {
                 .insert(1, row);
         }),
         ("first field is not a number", |cp, small| {
-            let mut row = small.genuine["a_fifo.csv"][5].clone();
+            let mut row = small.genuine["a_fifo.csv"][5].row.clone();
             row[0] = "five".to_string();
             cp.configs
                 .get_mut("a_fifo.csv")
@@ -1662,7 +1721,7 @@ fn first_signal_stops_gracefully_and_resume_completes_to_identical_csvs(signal: 
         .configs
         .iter()
         .filter(|(_, p)| p.rows.len() as u32 == p.runs)
-        .map(|(csv, _)| csv.clone())
+        .flat_map(|(csv, _)| [csv.clone(), quantiles_name(csv)])
         .collect();
     assert!(complete.contains("short.csv"));
     assert_eq!(scratch.csv_files(), complete);
@@ -1929,10 +1988,15 @@ fn a_panic_in_a_worker_names_the_job_keeps_the_checkpoint_and_fails() {
         [0].into_iter().collect::<BTreeSet<u32>>()
     );
     assert!(cp.completed_runs("b.csv").is_empty());
-    let genuine_a = lib::simulation::run_simulation(&configs[0], 0)
-        .csv_record(0)
-        .to_vec();
-    assert_eq!(cp.configs["a.csv"].rows[&0], genuine_a);
+    let genuine_a = lib::simulation::run_simulation(&configs[0], 0);
+    assert_eq!(
+        cp.configs["a.csv"].rows[&0],
+        genuine_a.csv_record(0).to_vec()
+    );
+    assert_eq!(
+        cp.configs["a.csv"].quantiles[&0],
+        genuine_a.delay_quantiles_ns
+    );
     assert!(scratch.csv_files().is_empty());
 }
 
