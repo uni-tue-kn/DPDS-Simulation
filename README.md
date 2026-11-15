@@ -90,12 +90,13 @@ back to the default):
 MAX_CONCURRENT_SIMULATIONS=8 cargo run --release --bin dpds_simulation
 ```
 
-Jobs are handed out run-major: run 0 of every config, then run 1 of every
-config, and so on, so an interrupted sweep has some runs of every config
-instead of all runs of a few. A config's CSV is written (atomically, from the
-rows of the checkpoint) once all of its runs have finished, with the rows sorted
-by run index. With a `seed` set, the files are byte-identical for any worker
-count and for any order or interruption of the runs.
+Jobs are handed out config-major: all runs of the first config, then all runs
+of the second, and so on. A config's CSV is written (atomically, from the rows
+of the checkpoint) as soon as all of its runs have finished, with the rows
+sorted by run index, so an interrupted sweep has complete CSVs for the configs
+done so far and the rest is in the checkpoint. With a `seed` set, the files
+are byte-identical for any worker count and for any order or interruption of
+the runs.
 
 ### Delay quantiles
 
@@ -346,7 +347,7 @@ of the paper):
   independent of the worker count. Rows in the CSVs are sorted by run index.
 - The sweep driver uses one flat rayon thread pool over all `(config, run)`
   jobs instead of tokio, defaulting to the available parallelism (previously 2
-  concurrent runs), hands them out run-major and checkpoints after every run
+  concurrent runs), hands them out config-major and checkpoints after every run
   (see [Checkpoint and resume](#checkpoint-and-resume)).
 - A transmit event at time `t` is processed before an arrival at `t` (tie
   rule), so a buffer slot freed at `t` is usable by the arrival at `t`.
@@ -376,7 +377,7 @@ The suite covers:
 - the checkpoint file (`tests/checkpoint.rs`: JSON shape, round trip, atomic
   write, strict loader, fingerprint) and the checkpointed sweep
   (`tests/checkpoint_cli.rs`: per-run saves, resume, prompts, `--fresh`,
-  `--dry-run`, run-major order, signals, panics, `--stop-at`/`--start-at`).
+  `--dry-run`, config-major order, signals, panics, `--stop-at`/`--start-at`).
 
 CI additionally runs `cargo fmt --all -- --check` and
 `cargo clippy --all-targets --all-features -- -D warnings`.

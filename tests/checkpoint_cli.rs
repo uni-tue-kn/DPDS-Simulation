@@ -1,6 +1,6 @@
 //! Binary-level tests of the checkpointed sweep driver (spec v11): per-run
 //! saves, resume, `--fresh`, the interactive prompt, strict abort rules,
-//! `--dry-run`, run-major order, signals, panics, `--stop-at`/`--start-at`.
+//! `--dry-run`, config-major order, signals, panics, `--stop-at`/`--start-at`.
 //!
 //! Every test drives the real `dpds_simulation` binary in its own scratch
 //! directory with tiny seeded configs. Expectations are computed
@@ -71,8 +71,11 @@
 //!   `csv_output_path` and the word `run`, keeps the runs completed so far
 //!   checkpointed and exits non-zero. (Tests assume the bad config is only
 //!   discovered when its job runs, as today.)
-//! * Job order is run-major: run 0 of every config (config order), then run
-//!   1 of every config that has one, and so on.
+//! * Job order is config-major: all runs of the first config (run 0, 1, ...),
+//!   then all runs of the second config, and so on (config order); runs
+//!   already in the checkpoint are skipped. A config's CSV is written as soon
+//!   as its last run is done, so the first CSVs appear long before the sweep
+//!   ends.
 //! * Unknown flags exit non-zero.
 //! * A completed sweep removes the checkpoint; CSV files are (re)written from
 //!   the checkpoint rows once a config is complete; no temp files remain.
@@ -649,20 +652,25 @@ fn total_rows(cp: &Checkpoint) -> usize {
     cp.configs.values().map(|c| c.rows.len()).sum()
 }
 
-/// Run-major job list, computed from the run counts only.
-fn run_major_plan(configs: &[Config]) -> Vec<(String, u32)> {
-    let max_runs = configs
+/// Config-major job list (all runs of a config, configs in file order),
+/// computed from the run counts only.
+fn job_plan(configs: &[Config]) -> Vec<(String, u32)> {
+    configs
         .iter()
-        .map(|c| c.simulation_config.runs)
-        .max()
-        .unwrap_or(0);
-    (0..max_runs)
-        .flat_map(|run| {
-            configs
-                .iter()
-                .filter(move |c| c.simulation_config.runs > run)
-                .map(move |c| (c.simulation_config.csv_output_path.clone(), run))
+        .flat_map(|c| {
+            (0..c.simulation_config.runs)
+                .map(move |run| (c.simulation_config.csv_output_path.clone(), run))
         })
+        .collect()
+}
+
+/// The result files (CSV and quantiles CSV) of the configs that are complete
+/// in the checkpoint: exactly the files a sweep must have written so far.
+fn complete_csv_files(cp: &Checkpoint) -> BTreeSet<String> {
+    cp.configs
+        .iter()
+        .filter(|(_, p)| p.rows.len() as u32 == p.runs)
+        .flat_map(|(csv, _)| [csv.clone(), quantiles_name(csv)])
         .collect()
 }
 
@@ -732,7 +740,7 @@ fn uninterrupted_sweep_writes_the_expected_csvs_and_removes_the_checkpoint() {
 #[test]
 fn checkpoint_is_saved_after_every_run_not_only_on_exit() {
     // SIGKILL cannot run any handler: whatever is on disk was saved by the
-    // per-run saves. Also checks run-major order (one worker => completion
+    // per-run saves. Also checks config-major order (one worker => completion
     // order = job order) and the stable cross-process fingerprint.
     let text = slow_text();
     let configs = parse(&text);
@@ -766,14 +774,14 @@ fn checkpoint_is_saved_after_every_run_not_only_on_exit() {
         fingerprint(&configs),
         "fingerprint written by the binary == library fingerprint"
     );
-    let plan = run_major_plan(&configs);
+    let plan = job_plan(&configs);
     let done = total_rows(&cp);
     assert!(
         (3..plan.len()).contains(&done),
         "{done} of {} jobs done",
         plan.len()
     );
-    // exactly the first `done` jobs of the run-major plan are recorded
+    // exactly the first `done` jobs of the plan are recorded
     let mut expected: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
     for (csv, run) in &plan[..done] {
         expected.entry(csv.clone()).or_default().insert(*run);
@@ -783,7 +791,7 @@ fn checkpoint_is_saved_after_every_run_not_only_on_exit() {
         assert_eq!(
             &recorded,
             expected.get(csv).unwrap_or(&BTreeSet::new()),
-            "{csv}: not the run-major prefix of {done} jobs"
+            "{csv}: not the plan prefix of {done} jobs"
         );
     }
     assert_recorded_rows_are_genuine(&cp, slow_rows());
@@ -1562,14 +1570,11 @@ fn stop_at_in_the_near_future_stops_gracefully_and_resume_completes() {
     let cp = checkpoint::load(&scratch.checkpoint_path()).expect("checkpoint after the stop");
     assert_eq!(cp.fingerprint, fingerprint(&configs));
     let done = total_rows(&cp);
-    let jobs = run_major_plan(&configs).len();
+    let jobs = job_plan(&configs).len();
     assert!((1..jobs).contains(&done), "{done} of {jobs} jobs done");
     let genuine = genuine_rows(&configs);
     assert_recorded_rows_are_genuine(&cp, &genuine);
-    assert!(
-        scratch.csv_files().is_empty(),
-        "no config can be complete yet"
-    );
+    assert_eq!(scratch.csv_files(), complete_csv_files(&cp));
 
     let outcome = run(
         &scratch,
@@ -1691,9 +1696,9 @@ fn first_signal_stops_gracefully_and_resume_completes_to_identical_csvs(signal: 
         },
         None,
     );
-    // run-major: the 2-run config is complete after the first 10 jobs
+    // config-major: the first config (12 runs) is complete after the first 12 jobs
     wait_for_checkpoint(&scratch, &mut proc, |cp| {
-        cp.completed_runs("short.csv").len() == 2
+        cp.completed_runs("s1.csv").len() == 12
     });
     proc.signal(signal);
     let status = proc.wait(TIMEOUT);
@@ -1711,19 +1716,14 @@ fn first_signal_stops_gracefully_and_resume_completes_to_identical_csvs(signal: 
 
     let cp = checkpoint::load(&scratch.checkpoint_path()).expect("checkpoint after the signal");
     assert_eq!(cp.fingerprint, fingerprint(&configs));
-    let jobs = run_major_plan(&configs).len();
+    let jobs = job_plan(&configs).len();
     let done = total_rows(&cp);
-    assert!((9..jobs).contains(&done), "{done} of {jobs} jobs done");
+    assert!((12..jobs).contains(&done), "{done} of {jobs} jobs done");
     assert_recorded_rows_are_genuine(&cp, slow_rows());
     // CSVs exist exactly for the complete configs, with the genuine content
     let expected = expected_csvs(slow_rows(), &[]);
-    let complete: BTreeSet<String> = cp
-        .configs
-        .iter()
-        .filter(|(_, p)| p.rows.len() as u32 == p.runs)
-        .flat_map(|(csv, _)| [csv.clone(), quantiles_name(csv)])
-        .collect();
-    assert!(complete.contains("short.csv"));
+    let complete = complete_csv_files(&cp);
+    assert!(complete.contains("s1.csv"));
     assert_eq!(scratch.csv_files(), complete);
     for csv in &complete {
         assert_eq!(
@@ -1774,7 +1774,7 @@ fn wait_for_output(proc: &mut Proc, needle: &str) {
 /// A sweep on two workers with a run of `long_s` simulated seconds in flight
 /// on one of them. Returns once that is certain.
 ///
-/// Jobs are handed out in run-major order, so the worker that takes the first
+/// Jobs are handed out in config-major order, so the worker that takes the first
 /// job (`long.csv` run 0) has started it before the other worker takes
 /// `marker.csv` run 0, and the checkpoint written when that run completes
 /// proves it. The other worker then carries on with the rest of `marker.csv`,
@@ -1962,8 +1962,8 @@ fn a_second_signal_after_the_stop_at_deadline_exits_immediately() {
 
 #[test]
 fn a_panic_in_a_worker_names_the_job_keeps_the_checkpoint_and_fails() {
-    // One worker, run-major: a.csv run 0 completes, then b.csv run 0 panics
-    // (capacity usize::MAX cannot be reserved).
+    // One worker, config-major: a.csv runs 0-2 complete (so a.csv is written),
+    // then b.csv run 0 panics (capacity usize::MAX cannot be reserved).
     let text = to_text(&[
         config_json("a.csv", 3, 0.0004, false, 31, no_extras),
         config_json("b.csv", 3, 0.0004, false, 32, |v| {
@@ -1985,19 +1985,23 @@ fn a_panic_in_a_worker_names_the_job_keeps_the_checkpoint_and_fails() {
     assert_eq!(cp.fingerprint, fingerprint(&configs));
     assert_eq!(
         cp.completed_runs("a.csv"),
-        [0].into_iter().collect::<BTreeSet<u32>>()
+        [0, 1, 2].into_iter().collect::<BTreeSet<u32>>()
     );
     assert!(cp.completed_runs("b.csv").is_empty());
-    let genuine_a = lib::simulation::run_simulation(&configs[0], 0);
+    let genuine = genuine_rows(&configs[..1]);
+    assert_recorded_rows_are_genuine(&cp, &genuine);
+    // a.csv is complete, so its CSVs were written; b.csv has none
+    let expected = expected_csvs(&genuine, &[]);
     assert_eq!(
-        cp.configs["a.csv"].rows[&0],
-        genuine_a.csv_record(0).to_vec()
+        scratch.csv_files(),
+        expected.keys().cloned().collect::<BTreeSet<String>>()
     );
-    assert_eq!(
-        cp.configs["a.csv"].quantiles[&0],
-        genuine_a.delay_quantiles_ns
-    );
-    assert!(scratch.csv_files().is_empty());
+    for (csv, text) in &expected {
+        assert_eq!(
+            &fs::read_to_string(scratch.results().join(csv)).unwrap(),
+            text
+        );
+    }
 }
 
 // -------------------------------------------------------------- write failures

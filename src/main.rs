@@ -122,27 +122,23 @@ fn fail(message: &str) -> ! {
 
 // ------------------------------------------------------------------ plan/jobs
 
-/// Run-major job list over the runs not yet in the checkpoint: run 0 of
-/// every config, then run 1 of every config that has one, and so on.
+/// Config-major job list over the runs not yet in the checkpoint: all pending
+/// runs of the first config, then of the second, and so on, so a config's CSV
+/// can be written as early as possible.
 fn pending_jobs(configs: &[Config], checkpoint: &Checkpoint) -> Vec<(usize, u32)> {
-    let max_runs = configs
-        .iter()
-        .map(|c| c.simulation_config.runs)
-        .max()
-        .unwrap_or(0);
-    (0..max_runs)
-        .flat_map(|run| {
-            configs
-                .iter()
-                .enumerate()
-                .filter(move |(_, c)| c.simulation_config.runs > run)
-                .map(move |(i, _)| (i, run))
-        })
-        .filter(|&(i, run)| {
-            let csv = &configs[i].simulation_config.csv_output_path;
-            !checkpoint.configs[csv].rows.contains_key(&run)
-        })
-        .collect()
+    let mut jobs = Vec::new();
+    for (i, config) in configs.iter().enumerate() {
+        let sim = &config.simulation_config;
+        for run in 0..sim.runs {
+            if !checkpoint.configs[&sim.csv_output_path]
+                .rows
+                .contains_key(&run)
+            {
+                jobs.push((i, run));
+            }
+        }
+    }
+    jobs
 }
 
 fn print_dry_run(configs: &[Config], checkpoint: Option<&Checkpoint>) {
