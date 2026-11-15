@@ -511,6 +511,8 @@ fn main() {
             .progress_chars("#>-"),
     );
     progress.set_position(done as u64);
+    // Redraws every second, so the elapsed time runs also while no run finishes.
+    progress.enable_steady_tick(Duration::from_secs(1));
 
     let sweep = Sweep {
         configs: &configs,
