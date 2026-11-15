@@ -506,15 +506,11 @@ fn main() {
     let progress = ProgressBar::new(total as u64);
     progress.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (ETA {eta}) {msg}",
-            )
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
             .expect("valid progress template")
             .progress_chars("#>-"),
     );
     progress.set_position(done as u64);
-    // The ETA must not count the resumed runs as done in no time.
-    progress.reset_eta();
 
     let sweep = Sweep {
         configs: &configs,

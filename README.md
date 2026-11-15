@@ -173,8 +173,7 @@ last completed run). A panic in a run prints the config and run that failed and
 exits non-zero; completed runs stay checkpointed (also with `panic = "abort"`:
 the panic hook ends the process itself).
 
-The progress bar shows completed/total runs, including the resumed ones, and an
-ETA.
+The progress bar shows completed/total runs, including the resumed ones.
 
 ### Buffer capacity
 
