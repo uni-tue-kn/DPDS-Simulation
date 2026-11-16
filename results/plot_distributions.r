@@ -431,30 +431,33 @@ if (nrow(df_quantiles) > 0) {
         panel.spacing.x = unit(1.5, "lines")
     )
 
-    # Plot 4: QQ plot (theoretical quantile on x, achieved quantile on y)
-    plot_qq <- ggplot(df_quantiles, aes(x = theoretical_ms, y = delay_ms, color = rate_config)) +
-        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
-        geom_point(size = point_size / 3) +
-        facet_wrap(~distribution, nrow = 1) +
-        scale_x_continuous(breaks = c(0, 10, 20)) +
-        scale_color_manual(values = rate_colors) +
-        base_theme +
-        legend_theme +
-        facet_theme +
-        guides(color = guide_legend(override.aes = list(size = point_size))) +
-        labs(
-            x = "Configured delay quantile (ms)",
-            y = "Achieved delay\nquantile (ms)",
-            color = "Rate (Gbit/s)"
-        )
+    # Plot 4: QQ plot (theoretical quantile on x, achieved quantile on y), one PDF per distribution
+    # because the paper includes them as sub-figures at half the column width. Each has its own
+    # axis range (the same on x and y): with a shared one the long log-normal tail would compress
+    # the other three distributions into a corner.
+    for (name in levels(df_quantiles$distribution)) {
+        df_qq <- df_quantiles[df_quantiles$distribution == name, ]
+        qq_limits <- range(df_qq$theoretical_ms, df_qq$delay_ms)
+        plot_qq <- ggplot(df_qq, aes(x = theoretical_ms, y = delay_ms, color = rate_config)) +
+            geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+            geom_point(size = point_size / 3) +
+            scale_x_continuous(limits = qq_limits) +
+            scale_y_continuous(limits = qq_limits) +
+            scale_color_manual(values = rate_colors, drop = FALSE) +
+            base_theme +
+            legend_theme +
+            theme(legend.title.position = "top") +
+            guides(color = guide_legend(override.aes = list(size = point_size))) +
+            labs(
+                x = "Configured delay\nquantile (ms)",
+                y = "Achieved delay\nquantile (ms)",
+                color = "Rate (Gbit/s)"
+            )
 
-    ggsave(
-        file = "distributions_qq.pdf",
-        plot = plot_qq,
-        device = cairo_pdf,
-        width = 14.4, height = 6
-    )
-    cat("\nPlot saved as: distributions_qq.pdf\n")
+        filename <- paste0("distributions_qq_", gsub("-", "", tolower(name)), ".pdf")
+        ggsave(file = filename, plot = plot_qq, device = cairo_pdf, width = 7.2, height = 7.8)
+        cat("\nPlot saved as:", filename, "\n")
+    }
 
     # Plot 5: PP plot (configured CDF at the achieved quantile on x, probability on y)
     plot_pp <- ggplot(df_quantiles, aes(x = theoretical_cdf, y = probability, color = rate_config)) +
