@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 library(ggplot2)
+source("center_x_title.r")
 library(magrittr)
 library(dplyr)
 library(scales)
