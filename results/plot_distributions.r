@@ -447,7 +447,12 @@ if (nrow(df_quantiles) > 0) {
             scale_color_manual(values = rate_colors, drop = FALSE) +
             base_theme +
             legend_theme +
-            theme(legend.title.position = "top") +
+            # Narrow plot: the y-axis labels take a quarter of the width, so legend and x-axis title are
+            # centred below the panel (not on the whole figure as in the wide plots).
+            theme(
+                legend.title.position = "top", legend.title = element_text(hjust = 0.5),
+                legend.location = "panel"
+            ) +
             guides(color = guide_legend(override.aes = list(size = point_size))) +
             labs(
                 x = "Configured delay\nquantile (ms)",
@@ -456,7 +461,7 @@ if (nrow(df_quantiles) > 0) {
             )
 
         filename <- paste0("distributions_qq_", gsub("-", "", tolower(name)), ".pdf")
-        ggsave(file = filename, plot = plot_qq, device = cairo_pdf, width = 7.2, height = 7.8)
+        ggplot2::ggsave(file = filename, plot = plot_qq, device = cairo_pdf, width = 7.2, height = 7.8)
         cat("\nPlot saved as:", filename, "\n")
     }
 
