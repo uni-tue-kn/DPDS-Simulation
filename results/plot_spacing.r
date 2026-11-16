@@ -132,8 +132,10 @@ df_aggregated <- df %>%
         kendall_tau_distance_div_n_sd = sd(kendall_tau_distance_div_n),
         out_of_order_packets_avg = mean(out_of_order_packets),
         out_of_order_packets_sd = sd(out_of_order_packets),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         delay_deviation_ms_avg = mean(delay_deviation_ms),
         delay_deviation_ms_sd = sd(delay_deviation_ms),
         jitter_deviation_ms_avg = mean(jitter_deviation_ms),

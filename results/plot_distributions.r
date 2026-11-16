@@ -121,11 +121,11 @@ df_aggregated <- df %>%
         delay_mean_ns_sd = sd(delay_mean_ns),
         delay_std_ns_avg = mean(delay_std_ns),
         delay_std_ns_sd = sd(delay_std_ns),
-        # A run that never crossed both thresholds reports 0: that is "no passage observed", not a
-        # passage time of 0 ns, so such runs are counted (passage_runs) but not averaged.
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
         passage_runs = sum(theoretical_passage_time_mean_ns > 0),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns[theoretical_passage_time_mean_ns > 0]),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns[theoretical_passage_time_mean_ns > 0]),
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         delay_deviation_ms_avg = mean(delay_deviation_ms),
         delay_deviation_ms_sd = sd(delay_deviation_ms),
         jitter_deviation_ms_avg = mean(jitter_deviation_ms),
@@ -147,11 +147,7 @@ df_aggregated <- df_aggregated %>%
         jitter_deviation_ms_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_ms_sd / sqrt(n_runs)),
         delay_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (delay_deviation_pct_sd / sqrt(n_runs)),
         jitter_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_pct_sd / sqrt(n_runs)),
-        theoretical_passage_time_mean_ns_ci = ifelse(
-            passage_runs > 1,
-            qt(1 - conf_alpha / 2, pmax(passage_runs, 2) - 1) * (theoretical_passage_time_mean_ns_sd / sqrt(passage_runs)),
-            NA_real_
-        )
+        theoretical_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (theoretical_passage_time_mean_ns_sd / sqrt(n_runs))
     )
 
 # Write the aggregated statistics to a CSV file
@@ -294,29 +290,17 @@ ggsave(
 cat("\nPlot saved as: distributions_jitter.pdf\n")
 
 # Plot 3: Theoretical Passage Time
-# A configuration is only drawn when every run observed a passage. If some runs did not (the delay
-# never crossed both thresholds within the simulated time), the passage time is censored: the mean of
-# the remaining runs underestimates it, so the point and its confidence interval are left out. The
-# row is kept (NA) so the dodge slot stays reserved and the axes match the delay/jitter plots.
+# A configuration without a passage in every run has an N/A passage time (see the aggregation): its
+# point and confidence interval are not drawn, the dodge slot stays reserved.
 censored <- df_aggregated %>% filter(passage_runs < n_runs)
 if (nrow(censored) > 0) {
-    cat("\nPassage time not drawn (runs without a passage within the simulated time):\n")
+    cat("\nPassage time N/A (not every run observed a passage within the simulated time):\n")
     for (i in seq_len(nrow(censored))) {
         r <- censored[i, ]
-        cat(sprintf(
-            "  %s, %s Gbit/s: %d of %d runs with a passage%s\n",
-            r$distribution, r$rate_config, r$passage_runs, r$n_runs,
-            if (r$passage_runs > 0) sprintf(", their mean %.1f s", r$theoretical_passage_time_mean_ns_avg / 1e9) else ""
-        ))
+        cat(sprintf("  %s, %s Gbit/s: %d of %d runs with a passage\n", r$distribution, r$rate_config, r$passage_runs, r$n_runs))
     }
 }
-df_passage_time <- df_aggregated %>%
-    mutate(
-        theoretical_passage_time_mean_ns_avg = ifelse(
-            passage_runs == n_runs,
-            theoretical_passage_time_mean_ns_avg, NA_real_
-        )
-    )
+df_passage_time <- df_aggregated
 
 plot_passage_time <- ggplot(df_passage_time, aes(
     x = rate_x,

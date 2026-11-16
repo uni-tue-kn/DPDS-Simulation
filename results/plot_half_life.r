@@ -117,8 +117,10 @@ df_aggregated <- df %>%
         delay_deviation_pct_sd = sd(delay_deviation_pct),
         jitter_deviation_pct_avg = mean(jitter_deviation_pct),
         jitter_deviation_pct_sd = sd(jitter_deviation_pct),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         n_runs = n(),
         .groups = "drop"
     ) %>%
