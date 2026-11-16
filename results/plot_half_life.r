@@ -275,7 +275,7 @@ for (dist in distributions) {
         file = paste0("half_life_delay_", dist, ".pdf"),
         plot = plot_delay & legend_theme,
         device = cairo_pdf,
-        width = 14.4, height = 6
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_delay_", dist, ".pdf\n"))
 
@@ -283,7 +283,7 @@ for (dist in distributions) {
         file = paste0("half_life_jitter_", dist, ".pdf"),
         plot = plot_jitter & legend_theme,
         device = cairo_pdf,
-        width = 14.4, height = 6
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_jitter_", dist, ".pdf\n"))
 
@@ -291,7 +291,7 @@ for (dist in distributions) {
         file = paste0("half_life_passage_time_", dist, ".pdf"),
         plot = plot_passage_time & legend_theme,
         device = cairo_pdf,
-        width = 14.4, height = 6
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_passage_time_", dist, ".pdf\n"))
 }

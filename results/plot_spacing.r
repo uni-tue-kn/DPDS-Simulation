@@ -237,7 +237,7 @@ for (dist in distributions) {
             file = paste0("spacing_delay_", bp, "_", dist, ".pdf"),
             plot = plot_delay,
             device = cairo_pdf,
-            width = 14.4, height = 6
+            width = 14.4, height = 6.6
         )
         cat(paste0("\nPlot saved as: spacing_delay_", bp, "_", dist, ".pdf\n"))
 
@@ -280,7 +280,7 @@ for (dist in distributions) {
             file = paste0("spacing_jitter_", bp, "_", dist, ".pdf"),
             plot = plot_jitter,
             device = cairo_pdf,
-            width = 14.4, height = 6
+            width = 14.4, height = 6.6
         )
         cat(paste0("\nPlot saved as: spacing_jitter_", bp, "_", dist, ".pdf\n"))
     }

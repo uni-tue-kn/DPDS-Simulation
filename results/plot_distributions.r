@@ -529,7 +529,12 @@ if (file.exists(benchmark_file)) {
             width = geom_errorbar_width / 2,
             linewidth = line_size
         ) +
-        scale_y_continuous(labels = label_number(big.mark = " ")) +
+        # The value above each bar (above its error bar), in black.
+        geom_text(
+            aes(y = msamples_per_sec_avg + msamples_per_sec_ci, label = sprintf("%.0f", msamples_per_sec_avg)),
+            vjust = -0.4, size = 0.8 * font_size / .pt, color = "black"
+        ) +
+        scale_y_continuous(labels = label_number(big.mark = " "), expand = expansion(mult = c(0.05, 0.15))) +
         expand_limits(y = 0) +
         scale_fill_manual(values = distribution_colors) +
         scale_color_manual(values = distribution_colors) +
@@ -545,7 +550,7 @@ if (file.exists(benchmark_file)) {
         file = "distributions_sampling_cost.pdf",
         plot = plot_sampling_cost,
         device = cairo_pdf,
-        width = 12, height = 6.5
+        width = 12, height = 8.4
     )
     cat("\nPlot saved as: distributions_sampling_cost.pdf\n")
 } else {
