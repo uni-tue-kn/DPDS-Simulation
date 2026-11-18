@@ -435,15 +435,18 @@ if (nrow(df_quantiles) > 0) {
     # Plot 4: QQ plot (theoretical quantile on x, achieved quantile on y), one PDF per distribution
     # because the paper includes them as sub-figures at half the column width. Each has its own
     # axis range (the same on x and y): with a shared one the long log-normal tail would compress
-    # the other three distributions into a corner.
+    # the other three distributions into a corner. Log axes: the achieved log-normal upper tail
+    # reaches about three times the largest configured quantile, which would leave most of a linear
+    # x-axis empty; on log axes the diagonal stays the diagonal. All four use them for consistency.
     for (name in levels(df_quantiles$distribution)) {
         df_qq <- df_quantiles[df_quantiles$distribution == name, ]
         qq_limits <- range(df_qq$theoretical_ms, df_qq$delay_ms)
+        qq_breaks <- c(1, 2, 5, 10, 20, 50, 100)
         plot_qq <- ggplot(df_qq, aes(x = theoretical_ms, y = delay_ms, color = rate_config)) +
             geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
             geom_point(size = point_size / 3) +
-            scale_x_continuous(limits = qq_limits) +
-            scale_y_continuous(limits = qq_limits) +
+            scale_x_log10(limits = qq_limits, breaks = qq_breaks) +
+            scale_y_log10(limits = qq_limits, breaks = qq_breaks) +
             scale_color_manual(values = rate_colors, drop = FALSE) +
             base_theme +
             legend_theme +
