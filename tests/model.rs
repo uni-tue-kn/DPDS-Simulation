@@ -37,9 +37,10 @@
 //!   ((frame+20)*8))`; arrivals with `t <= duration_ns` (inclusive, as before)
 //!   are processed; afterwards the buffer is drained, so every accepted packet
 //!   departs.
-//! * Frame length passed to `push_outcome` = `average_frame_size_byte.ceil()`.
-//!   dpds-core adds 4 (FEC) and 20 (L1) bytes: limiter size =
-//!   `(ceil(frame) + 4 + 20) * 8` bit.
+//! * `average_frame_size_byte` includes the 4-B FCS, like the arrival rate:
+//!   the length passed to `push_outcome` (DPDK's `pkt_len`, without FCS) is
+//!   `ceil(frame) - 4` (0 for frames below 4 B). dpds-core adds 4 (FCS) and
+//!   20 (L1) bytes: limiter size = `(ceil(frame) + 20) * 8` bit.
 //! * Pop at exact send times: `tx_time = max(clock, send_time)`; in FIFO mode a
 //!   packet blocked behind a later one leaves right after it (same instant).
 //! * TIE RULE at equal times: a transmit event at time t is processed BEFORE an
@@ -884,7 +885,7 @@ fn out_of_order_counter_with_drops_still_matches_the_trace() {
 // ------------------------------------------------------------------ limiters
 
 /// Service time of one packet at 0.5 bit/ns.
-const SERVICE_NS: u64 = 24_064;
+const SERVICE_NS: u64 = 24_000;
 
 /// `dpds_core::derived_limit_bit(capacity)` = capacity * 1542 * 8 = 12336 *
 /// capacity bit (1518 B frame + 4 FEC + 20 L1, as the limiter counts a packet).
@@ -899,17 +900,17 @@ fn derived_limit_is_capacity_times_the_maximum_wire_frame() {
     );
 }
 
-/// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = 12032 bit -> 24064 ns of
+/// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = 12000 bit -> 24000 ns of
 /// service, but one arrival per 10000 ns: a queue builds. With a delay of
 /// 300 us and a capacity of 20 packets (limit 246720 bit, about 20.5 packets)
 /// the buffer is the bottleneck: the queue the Spacer builds stays far below
 /// its limit while the 300 us delay keeps the buffer full, so arrivals are
 /// rejected as buffer-full. A buffer-full packet touches no limiter state,
 /// so the accepted packets keep EXACT spacing: every departure is
-/// 24064 ns after the previous one, the j-th is at 300000 + 24064 j (checked
+/// 24000 ns after the previous one, the j-th is at 300000 + 24000 j (checked
 /// with an independent re-implementation of buffer.rs/limiter.rs; before the
 /// capacity check moved first, rejected packets advanced the Spacer and left
-/// gaps of 48128 ns and more).
+/// gaps of 48000 ns and more).
 #[test]
 fn buffer_full_packets_do_not_advance_the_spacer() {
     let cfg = scenario()
@@ -942,7 +943,7 @@ fn buffer_full_packets_do_not_advance_the_spacer() {
 }
 
 /// Delay 1 ms and capacity 13: arrivals 0..12 fill the buffer and are
-/// spaced by the Spacer (send = 1e6 + 24064 k); 13..99 are rejected as
+/// spaced by the Spacer (send = 1e6 + 24000 k); 13..99 are rejected as
 /// buffer-full. When packet 0 leaves at 1 ms, arrival 100 (t = 1 ms, tie rule:
 /// transmit first) is accepted and finds an EMPTY Spacer: it leaves at exactly
 /// its own time-to-send, 2 ms. Had the 87 rejected packets been accounted, it
@@ -964,18 +965,18 @@ fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
         first_14,
         vec![
             (0, 1_000_000),
-            (1, 1_024_064),
-            (2, 1_048_128),
-            (3, 1_072_192),
-            (4, 1_096_256),
-            (5, 1_120_320),
-            (6, 1_144_384),
-            (7, 1_168_448),
-            (8, 1_192_512),
-            (9, 1_216_576),
-            (10, 1_240_640),
-            (11, 1_264_704),
-            (12, 1_288_768),
+            (1, 1_024_000),
+            (2, 1_048_000),
+            (3, 1_072_000),
+            (4, 1_096_000),
+            (5, 1_120_000),
+            (6, 1_144_000),
+            (7, 1_168_000),
+            (8, 1_192_000),
+            (9, 1_216_000),
+            (10, 1_240_000),
+            (11, 1_264_000),
+            (12, 1_288_000),
             (100, 2_000_000),
         ]
     );
@@ -984,16 +985,16 @@ fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
 
 /// Boundary of the derived limit of the SPACER. Rate 1e6 bit/s (drains
 /// 10 bit per arrival, negligible), zero delay, capacity 40: limit =
-/// 40 * 12336 = 493440 bit = 41.01 packets of 12032 bit, so the limiter lets
-/// exactly the first 41 pushes pass (41 * 12032 = 493312 <= 493440 < 42 *
-/// 12032) and rejects every later one. The Gilbert-Elliot model with
+/// 40 * 12336 = 493440 bit = 41.12 packets of 12000 bit, so the limiter lets
+/// exactly the first 41 pushes pass (41 * 12000 = 492000 <= 493440 < 42 *
+/// 12000) and rejects every later one. The Gilbert-Elliot model with
 /// p = r = 1, k = 1, h = 0 loses every second packet, starting with the second
 /// (the loss model is consulted for every pushed packet, also after the
 /// limiter has rejected it), and a lost packet takes precedence over a limiter
 /// rejection. Pushes 0..=40 pass the limiter: 21 survive (even indices).
 /// Pushes 41..=100: the odd ones (30) are Lost, the even ones (30) are
-/// LimiterDrop. A limit of 40 packets (12032 * 40, or 12304 * 40) would let
-/// only 20 survive.
+/// LimiterDrop. A limit of 40 packets of 12000 bit would let only 20
+/// survive.
 #[test]
 fn spacer_limit_is_the_derived_capacity_times_12336_bit() {
     let cfg = scenario()
@@ -1015,7 +1016,7 @@ fn spacer_limit_is_the_derived_capacity_times_12336_bit() {
 }
 
 #[test]
-fn spacer_below_offered_load_without_limit_pressure_departs_every_24064_ns() {
+fn spacer_below_offered_load_without_limit_pressure_departs_every_service_time() {
     let cfg = scenario()
         .delay("DeterministicDistribution", 1_000_000., 0.)
         .limiter("Spacer", 0.5e9)
@@ -1023,7 +1024,7 @@ fn spacer_below_offered_load_without_limit_pressure_departs_every_24064_ns() {
     let (_, deps) = trace(&cfg, 0);
     assert_eq!(deps.len(), 101);
     for (k, d) in deps.iter().enumerate() {
-        assert_eq!(d.send_time_ns, 1_000_000 + 24_064 * k as u64);
+        assert_eq!(d.send_time_ns, 1_000_000 + SERVICE_NS * k as u64);
         assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
     }
 }
@@ -1039,10 +1040,38 @@ fn spacer_above_offered_load_neither_delays_nor_drops() {
     }
 }
 
+/// `average_frame_size_byte` includes the 4-B FCS, so a 1518-B frame occupies
+/// (1518 + 20) * 8 = 12304 bit on the wire, both for the arrival process and
+/// for the Spacer. Spacer at offered rate / 0.999 (utilization 0.999): it drains
+/// more than one frame per inter-arrival time, so no queue ever builds and
+/// every packet leaves at its arrival. Counting the FCS twice (1542 B) would
+/// give utilization 0.999 * 1542 / 1538 > 1 and a delay growing by ~1.6 ns per
+/// packet (~1.6 us after 1001 packets).
+#[test]
+fn spacer_just_above_the_offered_load_never_delays_full_size_frames() {
+    let rate_gbps = 12.304; // 12304 bit per frame -> iat 1000 ns
+    let cfg = scenario()
+        .with("average_frame_size_byte", json!(1518))
+        .with("rate_gbps", json!(rate_gbps))
+        .limiter("Spacer", rate_gbps * 1e9 / 0.999)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 1001);
+    assert_eq!(r.dropped_packets_limiter, 0);
+    let max_delay_ns = deps
+        .iter()
+        .map(|d| d.tx_time_ns - d.rx_time_ns)
+        .fold(0., f64::max);
+    assert!(
+        max_delay_ns < 1.0,
+        "Spacer at utilization 0.999 queued packets: max delay {max_delay_ns} ns"
+    );
+}
+
 #[test]
 fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
-    // 1479.2 B -> 1480 B -> 12032 bit -> 24064 ns spacing (floor/round would
-    // give 24048). The backlog exists from the second packet on; allow 1 ns
+    // 1479.2 B -> 1480 B -> 12000 bit -> 24000 ns spacing (floor/round would
+    // give 23984). The backlog exists from the second packet on; allow 1 ns
     // for float noise because the arrival spacing is not an integer here.
     let cfg = scenario()
         .with("average_frame_size_byte", json!(1479.2))
@@ -1052,16 +1081,16 @@ fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
     assert!(deps.len() > 20);
     for pair in deps.windows(2).skip(5) {
         let gap = pair[1].tx_time_ns - pair[0].tx_time_ns;
-        assert!((24_063.0..=24_065.0).contains(&gap), "gap {gap}");
+        assert!((23_999.0..=24_001.0).contains(&gap), "gap {gap}");
     }
 }
 
 /// TBF at 0.5 bit/ns with capacity 3: the bucket is the derived 3 * 12336 =
 /// 37008 bit (starts full), gains 5000 bit per arrival and a packet costs
-/// 12032 bit. Zero delay, so the buffer never holds anything. Hand derivation
+/// 12000 bit. Zero delay, so the buffer never holds anything. Hand derivation
 /// (checked with an independent re-implementation of limiter.rs): accept
-/// 0,1,2,3 (37008 -> 24976, 17944, 10912, 3880 after), drop 4 (8880 < 12032),
-/// accept 5, then 8, 10, 12, 15, 17, 20, 22, ... Out-of-budget packets are
+/// 0,1,2,3 (37008 -> 25008, 18008, 11008, 4008 after), drop 4 (9008 < 12000),
+/// accept 5, then 7, 10, 12, 15, 17, 19, 22, ... Out-of-budget packets are
 /// dropped (not delayed) and accepted ones are not delayed either.
 #[test]
 fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
@@ -1071,7 +1100,7 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
         .build();
     let (r, deps) = trace(&cfg, 0);
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
-    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 12, 15, 17, 20, 22]);
+    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 7, 10, 12, 15, 17, 19, 22]);
     assert_eq!(deps.len(), 44);
     assert_eq!(r.dropped_packets_limiter, 57);
     for d in &deps {
@@ -1082,13 +1111,13 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
 /// Boundary of the derived limit of the TOKEN BUCKET FILTER: the bucket
 /// starts full with `capacity * 12336` bit and, at 1000 bit/s (0.01 bit
 /// gained per arrival), is not refilled to speak of, so the number of
-/// admitted packets is `floor(capacity * 12336 / 12032)`: 1 for capacity 1
-/// and 2 for 2, but 39 for 39 (481104 bit: 39 * 12032 = 469248 leaves 11856 <
-/// 12032) and 41 for 40 (493440 >= 41 * 12032 = 493312). A limit of
-/// `capacity * 12032` bit would admit 40 for capacity 40.
+/// admitted packets is `floor(capacity * 12336 / 12000)`: 1 for capacity 1
+/// and 2 for 2, but 40 for 39 (481104 bit >= 40 * 12000 = 480000) and 41 for
+/// 40 (493440 >= 41 * 12000 = 492000). A limit of `capacity * 12000` bit would
+/// admit 39 for capacity 39.
 #[test]
 fn token_bucket_depth_is_the_derived_capacity_times_12336_bit() {
-    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 39), (40, 41), (41, 42)] {
+    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 40), (40, 41), (41, 42)] {
         let cfg = scenario()
             .capacity(capacity)
             .limiter("TokenBucketFilter", 1e3)
@@ -1280,7 +1309,7 @@ fn buffer_full_packets_consume_no_loss_draw() {
 // ----------------------------------------------- reordering with a Spacer
 
 /// Reordering (heap) + active Spacer: 501 packets, delay 1 ms +- 300 us
-/// (heavy reordering), Spacer at 0.5 Gbit/s (24064 ns per packet against 10000
+/// (heavy reordering), Spacer at 0.5 Gbit/s (24000 ns per packet against 10000
 /// ns inter-arrival time, so a backlog builds and spacing is substantial).
 fn spaced_reordering(spacer: bool) -> Config {
     let s = scenario()
@@ -1325,13 +1354,14 @@ fn reordering_with_a_spacer_spaces_the_reordered_departures_of_the_same_run_with
     assert_eq!(reordered.len(), 501);
 
     // Reference: the heap times (= send times without a limiter) in departure
-    // order through a standalone Spacer, with the FEC bytes the buffer adds.
+    // order through a standalone Spacer. The frame size includes the FCS, so
+    // the Spacer gets it unchanged (the buffer adds back the 4 B the
+    // simulation removed).
     let frame = scenario()
         .build()
         .simulation_config
         .average_frame_size_byte
-        .ceil() as u32
-        + 4;
+        .ceil() as u32;
     let mut spacer = Limiter::new(LimiterMode::Spacer, true, 0.5e9, f64::MAX);
     let expected: Vec<f64> = reordered
         .iter()

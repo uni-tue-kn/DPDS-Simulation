@@ -67,9 +67,10 @@ Rules:
   before an earlier accepted one waits until that one has departed (identical
   to feeding at push in FIFO mode). The delay histogram uses `tx - rx` at the
   departure.
-- Frame length passed to the buffer is `ceil(average_frame_size_byte)`;
-  `dpds-core` adds 4 bytes (FEC) and the 20 bytes of L1 overhead itself, so
-  the limiter sees `(ceil(frame) + 4 + 20) * 8` bit.
+- Frame length passed to the buffer is `ceil(average_frame_size_byte) - 4`
+  (saturating), i.e. DPDK's packet length without the FCS. `dpds-core` adds
+  the 4 FCS bytes and the 20 bytes of L1 overhead itself, so the limiter sees
+  `(ceil(frame) + 20) * 8` bit, the same wire size the arrivals are spaced by.
 
 ## Running a simulation
 
@@ -330,8 +331,9 @@ of the paper):
   rejections are counted in `dropped_packets_buffer_full`. If a packet is both lost and rejected by the
   limiter, it counts as lost.
 - New optional config fields `buffer_capacity`, `loss_model`, `seed`.
-- Results include the 4 FEC bytes `dpds-core` adds to every frame for the
-  limiter.
+- The configured frame size includes the FCS. The simulation hands
+  `dpds-core` the length without it, so the limiter counts the same
+  `frame + 20` bytes per packet as the arrival rate.
 - The correlated delayer starts from the config's offered packet rate
   (`initialization_rate_pps` = 1e9 / inter-arrival time in ns, a required
   `dpds-core` field), as the old model did; it is derived, not a config field.

@@ -84,7 +84,10 @@ pub fn run_simulation_traced<F: FnMut(&Departure)>(
         statistics.init_passage_time_tracker(delay.mean_ns, delay.std_ns);
     }
 
-    let frame_byte = sim.average_frame_size_byte.ceil() as u32;
+    // dpds-core expects DPDK's packet length, which excludes the 4-byte FCS (it adds
+    // the FCS and the 20-byte L1 overhead itself). The configured frame size includes
+    // the FCS, so a 1518-byte frame is handed over as 1514 bytes and counts 1538 bytes.
+    let frame_byte = (sim.average_frame_size_byte.ceil() as u32).saturating_sub(4);
     let inter_arrival_time_ns = inter_arrival_time_ns(sim);
     let duration_ns = duration_ns(sim);
 
