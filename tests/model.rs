@@ -112,7 +112,7 @@ impl Scenario {
         self
     }
     /// The limiter has no limit of its own: dpds-core derives it from the
-    /// buffer capacity (`derived_limit_bit`, capacity x 12336 bit).
+    /// buffer capacity (`derived_limit_bit`, capacity x 12304 bit).
     fn limiter(mut self, mode: &str, rate_bps: f64) -> Self {
         self.limiter = Some(json!({"mode": mode, "rate_bps": rate_bps}));
         self
@@ -887,22 +887,23 @@ fn out_of_order_counter_with_drops_still_matches_the_trace() {
 /// Service time of one packet at 0.5 bit/ns.
 const SERVICE_NS: u64 = 24_000;
 
-/// `dpds_core::derived_limit_bit(capacity)` = capacity * 1542 * 8 = 12336 *
-/// capacity bit (1518 B frame + 4 FEC + 20 L1, as the limiter counts a packet).
+/// `dpds_core::derived_limit_bit(capacity)` = capacity * 1538 * 8 = 12304 *
+/// capacity bit (1518 B frame incl. FCS + 20 L1, as the limiter counts a
+/// maximum-size packet).
 #[test]
 fn derived_limit_is_capacity_times_the_maximum_wire_frame() {
-    assert_eq!(dpds_core::MAX_FRAME_WIRE_BYTES, 1542);
-    assert_eq!(dpds_core::derived_limit_bit(1), 12_336.0);
-    assert_eq!(dpds_core::derived_limit_bit(40), 493_440.0);
+    assert_eq!(dpds_core::MAX_FRAME_WIRE_BYTES, 1538);
+    assert_eq!(dpds_core::derived_limit_bit(1), 12_304.0);
+    assert_eq!(dpds_core::derived_limit_bit(110), 1_353_440.0);
     assert_eq!(
         dpds_core::derived_limit_bit(2_097_152),
-        2_097_152.0 * 12_336.0
+        2_097_152.0 * 12_304.0
     );
 }
 
 /// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = 12000 bit -> 24000 ns of
 /// service, but one arrival per 10000 ns: a queue builds. With a delay of
-/// 300 us and a capacity of 20 packets (limit 246720 bit, about 20.5 packets)
+/// 300 us and a capacity of 20 packets (limit 246080 bit, about 20.5 packets)
 /// the buffer is the bottleneck: the queue the Spacer builds stays far below
 /// its limit while the 300 us delay keeps the buffer full, so arrivals are
 /// rejected as buffer-full. A buffer-full packet touches no limiter state,
@@ -983,36 +984,38 @@ fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
     assert_eq!(deps.len(), 14);
 }
 
-/// Boundary of the derived limit of the SPACER. Rate 1e6 bit/s (drains
-/// 10 bit per arrival, negligible), zero delay, capacity 40: limit =
-/// 40 * 12336 = 493440 bit = 41.12 packets of 12000 bit, so the limiter lets
-/// exactly the first 41 pushes pass (41 * 12000 = 492000 <= 493440 < 42 *
-/// 12000) and rejects every later one. The Gilbert-Elliot model with
-/// p = r = 1, k = 1, h = 0 loses every second packet, starting with the second
-/// (the loss model is consulted for every pushed packet, also after the
-/// limiter has rejected it), and a lost packet takes precedence over a limiter
-/// rejection. Pushes 0..=40 pass the limiter: 21 survive (even indices).
-/// Pushes 41..=100: the odd ones (30) are Lost, the even ones (30) are
-/// LimiterDrop. A limit of 40 packets of 12000 bit would let only 20
-/// survive.
+/// Boundary of the derived limit of the SPACER. Rate 1000 bit/s (drains
+/// 0.01 bit per arrival, negligible), zero delay, 201 arrivals, capacity 110:
+/// limit = 110 * 12304 = 1353440 bit = 112.79 packets of 12000 bit, so the
+/// limiter lets exactly the first 112 pushes pass (112 * 12000 = 1344000 <=
+/// 1353440 < 113 * 12000) and rejects every later one. The Gilbert-Elliot
+/// model with p = r = 1, k = 1, h = 0 loses every second packet, starting with
+/// the second (the loss model is consulted for every pushed packet, also after
+/// the limiter has rejected it), and a lost packet takes precedence over a
+/// limiter rejection. Pushes 0..=111 pass the limiter: 56 survive (even
+/// indices). Pushes 112..=200: the odd ones (44) are Lost, the even ones (45)
+/// are LimiterDrop. A slot of 12336 bit (limit 1356960) would let push 112
+/// pass too (57 survive), one of 12000 bit only pushes 0..=109 (55 survive).
 #[test]
-fn spacer_limit_is_the_derived_capacity_times_12336_bit() {
+fn spacer_limit_is_the_derived_capacity_times_12304_bit() {
     let cfg = scenario()
-        .capacity(40)
+        .with("duration_s", json!(0.002))
+        .capacity(110)
         .with(
             "loss_model",
             json!({"GilbertElliot": [1.0, 1.0, 1.0, 0.0, true]}),
         )
-        .limiter("Spacer", 1e6)
+        .limiter("Spacer", 1e3)
         .build();
     let (r, deps) = trace(&cfg, 0);
-    assert_eq!(deps.len(), 21);
+    assert_eq!(expected_arrivals(&cfg), 201);
+    assert_eq!(deps.len(), 56);
     assert_eq!(
-        r.dropped_packets_limiter, 30,
+        r.dropped_packets_limiter, 45,
         "lost packets are not counted"
     );
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
-    assert_eq!(seqs, (0..=40).step_by(2).collect::<Vec<u64>>());
+    assert_eq!(seqs, (0..=110).step_by(2).collect::<Vec<u64>>());
 }
 
 #[test]
@@ -1085,12 +1088,13 @@ fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
     }
 }
 
-/// TBF at 0.5 bit/ns with capacity 3: the bucket is the derived 3 * 12336 =
-/// 37008 bit (starts full), gains 5000 bit per arrival and a packet costs
+/// TBF at 0.5 bit/ns with capacity 3: the bucket is the derived 3 * 12304 =
+/// 36912 bit (starts full), gains 5000 bit per arrival and a packet costs
 /// 12000 bit. Zero delay, so the buffer never holds anything. Hand derivation
 /// (checked with an independent re-implementation of limiter.rs): accept
-/// 0,1,2,3 (37008 -> 25008, 18008, 11008, 4008 after), drop 4 (9008 < 12000),
-/// accept 5, then 7, 10, 12, 15, 17, 19, 22, ... Out-of-budget packets are
+/// 0,1,2,3 (36912 -> 24912, 17912, 10912, 3912 after), drop 4 (8912 < 12000),
+/// accept 5, then 8, 10, 12, 15, 17, 20, 22, ... (a 37008-bit bucket would
+/// accept 7 and 19 instead of 8 and 20). Out-of-budget packets are
 /// dropped (not delayed) and accepted ones are not delayed either.
 #[test]
 fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
@@ -1100,7 +1104,7 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
         .build();
     let (r, deps) = trace(&cfg, 0);
     let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
-    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 7, 10, 12, 15, 17, 19, 22]);
+    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 12, 15, 17, 20, 22]);
     assert_eq!(deps.len(), 44);
     assert_eq!(r.dropped_packets_limiter, 57);
     for d in &deps {
@@ -1109,15 +1113,15 @@ fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
 }
 
 /// Boundary of the derived limit of the TOKEN BUCKET FILTER: the bucket
-/// starts full with `capacity * 12336` bit and, at 1000 bit/s (0.01 bit
+/// starts full with `capacity * 12304` bit and, at 1000 bit/s (0.01 bit
 /// gained per arrival), is not refilled to speak of, so the number of
-/// admitted packets is `floor(capacity * 12336 / 12000)`: 1 for capacity 1
-/// and 2 for 2, but 40 for 39 (481104 bit >= 40 * 12000 = 480000) and 41 for
-/// 40 (493440 >= 41 * 12000 = 492000). A limit of `capacity * 12000` bit would
-/// admit 39 for capacity 39.
+/// admitted packets is `floor(capacity * 12304 / 12000)`: 1 for capacity 1,
+/// 2 for 2 and 39 for 39 (479856 bit < 40 * 12000 = 480000), but 41 for 40
+/// (492160 >= 41 * 12000 = 492000). A depth of `capacity * 12000` bit would
+/// admit 40 for capacity 40, one of `capacity * 12336` bit 40 for 39.
 #[test]
-fn token_bucket_depth_is_the_derived_capacity_times_12336_bit() {
-    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 40), (40, 41), (41, 42)] {
+fn token_bucket_depth_is_the_derived_capacity_times_12304_bit() {
+    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 39), (40, 41), (41, 42)] {
         let cfg = scenario()
             .capacity(capacity)
             .limiter("TokenBucketFilter", 1e3)
@@ -1135,7 +1139,7 @@ fn token_bucket_depth_is_the_derived_capacity_times_12336_bit() {
 }
 
 /// Capacity 3, TBF at 0.5 bit/ns, delay 1 ms (100 inter-arrival times).
-/// Arrivals 0,1,2 are accepted (bucket 37008 -> 10912 bit) and fill the
+/// Arrivals 0,1,2 are accepted (bucket 36912 -> 912 bit) and fill the
 /// buffer; 3..99 are rejected as buffer-full and must NOT consume tokens: at
 /// arrival 100 (tie rule: packet 0 leaves first) the bucket has refilled
 /// completely, so 100, 101, 102 are accepted again, and so on. The cycle

@@ -274,7 +274,7 @@ fn readme_documents_the_checkpoint_flags_and_the_buffer_capacity_default() {
 #[test]
 fn readme_does_not_mention_limit_bit_and_explains_the_derived_limit() {
     // dpds-core removed `LimiterConfig.limit_bit`: the limit of both limiter
-    // modes is `buffer_capacity * 1542 * 8` bit (derived_limit_bit).
+    // modes is `buffer_capacity * 1538 * 8` bit (derived_limit_bit).
     let readme = read_repo_file("README.md");
     for (n, line) in readme.lines().enumerate() {
         assert!(
@@ -284,8 +284,8 @@ fn readme_does_not_mention_limit_bit_and_explains_the_derived_limit() {
         );
     }
     assert!(
-        readme.contains("1542"),
-        "README must state the derived limit (buffer_capacity * 1542 * 8 bit)"
+        readme.contains("1538"),
+        "README must state the derived limit (buffer_capacity * 1538 * 8 bit)"
     );
 }
 
