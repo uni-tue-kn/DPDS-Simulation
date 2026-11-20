@@ -178,19 +178,24 @@ The progress bar shows completed/total runs, including the resumed ones.
 
 ### Buffer capacity
 
-Each run reserves 16 B per packet of `buffer_capacity` up front (32 MiB for
-the default 2^21 = 2097152). The buffer must never be the bottleneck, so the
+Each run reserves 16 B per packet of `buffer_capacity` up front (1 GiB for
+the default 2^26 = 67108864); the reordering wheel reserves a few such arrays. The buffer must never be the bottleneck, so the
 capacity has to exceed the number of packets in flight, about
 `rate_pps * (mean_ns + a few std_ns) / 1e9` plus the limiter's queue,
 which the buffer bounds as well: dpds-core derives the limiter limit as
 `buffer_capacity * 1538 B * 8` (1518 B maximum frame including its FCS + 20 B L1 overhead)
 and checks for buffer room before the delay, spacing and loss. For the committed grid the largest value is the
 100 Gbit/s, 30 ms configuration: 8.13 Mpps * 30 ms = 0.24 M packets, 0.39 M
-at mean + 6 std (its largest jitter, 3 ms, gives 48 ms). 2^21 therefore holds
-with a margin of about a factor of 5.4 over the worst config by this
-estimate (a 90 s simulated run of it peaked at 0.35 M packets in flight; the
-99 % spacer configs at 100 Gbit/s, whose limiter queue adds to the delay,
-peaked at 0.20 M in 400 s), not orders of magnitude: when adding
+at mean + 6 std (its largest jitter, 3 ms, gives 48 ms; a 90 s simulated run
+of it peaked at 0.35 M packets in flight; the 99 % spacer configs at
+100 Gbit/s, whose limiter queue adds to the delay, peaked at 0.20 M in 400 s).
+The heavy-tailed log-normal distribution with correlation needs far more: at
+100 Gbit/s, 3 ms jitter and a 21 ms half-life its samples have a standard
+deviation of about 2.1 s, so a single extreme sample can raise the averaged
+delay to seconds, and every packet behind it stays in the buffer. With the
+former default 2^21 (258 ms of traffic at 8.13 Mpps) 5 of 10 such runs
+overflowed. 2^26 holds 8.3 s, which a tail estimate puts at about 0.2 % for
+any overflow in 10 runs. When adding
 configs with a larger rate-delay product, set `buffer_capacity` explicitly and
 check that `dropped_packets_buffer_full` stays 0 (runs with drops for lack of
 buffer room are not valid and should be re-run with a larger `buffer_capacity`).
@@ -232,7 +237,7 @@ has a required `simulation_config` and optional `delay_config` and
     "activate_reordering": false,      // allow packets to be emitted out of order
     "csv_output_path": "basic_normal_10ms_100us_0.1Gbps.csv",
     "reordering_metric": "out_of_order_counter", // or "kendall_tau_distance" (optional, default: out_of_order_counter)
-    "buffer_capacity": 2097152,        // optional, packets the dpds-core buffer holds (default: 2^21, see below)
+    "buffer_capacity": 67108864,       // optional, packets the dpds-core buffer holds (default: 2^26, see below)
     "loss_model": {"Random": 0.01},    // optional, default {"Random": 0.0}; or {"GilbertElliot": [p, r, k, h, true]}
     "seed": 42                         // optional; run r is seeded with seed + r (default: OS entropy, not reproducible)
   },

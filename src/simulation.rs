@@ -44,7 +44,7 @@ use crate::results::SimulationResults;
 use crate::statistics::{ReorderingMetric, SimulationStatistics};
 
 /// Buffer capacity in packets when the config does not set `buffer_capacity`.
-pub const DEFAULT_BUFFER_CAPACITY: usize = 1 << 21;
+pub const DEFAULT_BUFFER_CAPACITY: usize = 1 << 26;
 
 /// One transmitted packet, reported by [`run_simulation_traced`].
 #[derive(Debug, Clone, Copy, PartialEq)]

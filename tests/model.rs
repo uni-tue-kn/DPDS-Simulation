@@ -17,7 +17,7 @@
 //!     send_time_ns: u64, // send time from pop_due_with_time (whole ns)
 //!     tx_time_ns: f64,   // simulation time of the transmit event (pop time)
 //! }
-//! lib::simulation::DEFAULT_BUFFER_CAPACITY: usize = 1 << 21
+//! lib::simulation::DEFAULT_BUFFER_CAPACITY: usize = 1 << 26
 //! lib::results::CSV_HEADER: [&str; 8] or &[&str]    // the 8 column names, see csv_header_is_exact
 //! lib::results::SimulationResults                   // only fields that feed a CSV column:
 //!     delay_mean_ns, delay_std_ns, kendall_tau_distance_div_n,
@@ -25,7 +25,7 @@
 //!     dropped_packets_limiter: u64   // sanity check: limiter rejections
 //!     dropped_packets_buffer_full: u64  // arrivals rejected as BufferFull (last CSV column)
 //! lib::config::SimulationConfig (all `#[serde(default, skip_serializing_if = "Option::is_none")]`)
-//!     + buffer_capacity: Option<usize>   // default (None): 2^21 (`DEFAULT_BUFFER_CAPACITY`)
+//!     + buffer_capacity: Option<usize>   // default (None): 2^26 (`DEFAULT_BUFFER_CAPACITY`)
 //!     + loss_model: Option<dpds_core::dropper::LossModel>  // None = Random(0.0)
 //!     + seed: Option<u64>                // Some(s): run r is seeded with s + r
 //! ```
@@ -509,32 +509,32 @@ fn default_buffer_capacity_does_not_bind() {
 }
 
 #[test]
-fn default_buffer_capacity_is_two_to_the_twenty_one() {
-    // M2: each run reserves 16 B x capacity up front; 2^21 = 32 MiB, which
-    // leaves a margin over the ~0.96 M packets in flight of the largest
-    // committed config (mean + 6 std)
-    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 1 << 21);
-    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 2_097_152);
+fn default_buffer_capacity_is_two_to_the_twenty_six() {
+    // M2: each run reserves 16 B x capacity up front; 2^26 = 1 GiB holds
+    // 8.3 s of 1518 B traffic at 100 Gbit/s, enough for the delay spikes of
+    // the correlated log-normal distribution that overflowed 2^21
+    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 1 << 26);
+    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 67_108_864);
 }
 
 #[test]
-fn default_capacity_binds_exactly_at_two_to_the_twenty_one_packets_in_flight() {
+fn default_capacity_binds_exactly_at_two_to_the_twenty_six_packets_in_flight() {
     // 100 Gbit/s, 64 B frames -> iat = 6.72 ns; every packet is held for 1 s
-    // (far beyond the 14.5 ms of arrivals), so nothing departs while arrivals
+    // (far beyond the 455 ms of arrivals), so nothing departs while arrivals
     // last and the buffer holds exactly `capacity` packets, FIFO and heap.
     for reordering in [false, true] {
         let cfg = scenario()
-            .with("duration_s", json!(0.0145)) // 2.16 M arrivals
+            .with("duration_s", json!(0.455)) // 67.7 M arrivals
             .with("rate_gbps", json!(100.0))
             .with("average_frame_size_byte", json!(64))
             .delay("DeterministicDistribution", 1_000_000_000., 0.)
             .reorder(reordering)
             .build();
         let arrivals = expected_arrivals(&cfg);
-        assert!(arrivals > (1 << 21) + 50_000, "{arrivals} arrivals");
+        assert!(arrivals > (1 << 26) + 50_000, "{arrivals} arrivals");
         let mut departures = 0u64;
         run_simulation_traced(&cfg, 0, |_| departures += 1);
-        assert_eq!(departures, 1 << 21, "reordering={reordering}");
+        assert_eq!(departures, 1 << 26, "reordering={reordering}");
     }
 }
 

@@ -234,19 +234,19 @@ fn readme_documents_the_checkpoint_flags_and_the_buffer_capacity_default() {
         "--stop-at",
         "--start-at",
         ".checkpoint.json",
-        "2^21",
+        "2^26",
     ] {
         assert!(readme.contains(needle), "README must mention {needle}");
     }
-    // M2: the default is 2^21 = 2097152 everywhere, never 2^20 or 2^24
+    // M2: the default is 2^26 = 67108864 everywhere, never the former 2^21
     let example = readme
         .lines()
         .find(|l| l.contains("\"buffer_capacity\":"))
         .expect("README config example shows buffer_capacity");
-    assert!(example.contains("2^21"), "{example}");
-    assert!(example.contains("2097152"), "{example}");
+    assert!(example.contains("2^26"), "{example}");
+    assert!(example.contains("67108864"), "{example}");
     assert!(
-        !example.contains("2^20") && !example.contains("2^24"),
+        !example.contains("2^21") && !example.contains("2097152"),
         "{example}"
     );
     let section = readme
@@ -256,7 +256,7 @@ fn readme_documents_the_checkpoint_flags_and_the_buffer_capacity_default() {
         .split("\n#")
         .next()
         .unwrap();
-    assert!(section.contains("2^21"), "{section}");
+    assert!(section.contains("2^26"), "{section}");
     assert!(
         !section.contains("2^20") && !section.contains("2^24"),
         "{section}"

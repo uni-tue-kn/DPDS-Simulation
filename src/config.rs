@@ -21,7 +21,7 @@ pub struct SimulationConfig {
     pub csv_output_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reordering_metric: Option<ReorderingMetric>,
-    /// Capacity of the `dpds-core` buffer in packets (default: 2^21, large
+    /// Capacity of the `dpds-core` buffer in packets (default: 2^26, large
     /// enough not to bind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_capacity: Option<usize>,
