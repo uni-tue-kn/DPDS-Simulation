@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 library(ggplot2)
+source("center_x_title.r")
 library(magrittr)
 library(dplyr)
 library(scales)
@@ -19,9 +20,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 3
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 5.3
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.5
 
@@ -41,10 +42,7 @@ df <- data.frame(
     rate_config = character(),
     rate_numeric = numeric(),
     delay_mean_ns = numeric(),
-    delay_std_ns = numeric(),
-    inter_arrival_time_mean_ns = numeric(),
-    inter_arrival_time_std_ns = numeric(),
-    tracked_packets = numeric()
+    delay_std_ns = numeric()
 )
 
 # Read all CSV files for each half_life (filenames encode the half_life t_h)
@@ -77,19 +75,20 @@ for (memory in memories) {
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), ")"
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), ")"
     ))
 }
 
-dropped_bvq <- df %>% filter(dropped_packets_burst_virtual_queue > 0)
-if (nrow(dropped_bvq) > 0) {
+dropped_full <- df %>% filter(dropped_packets_buffer_full > 0)
+if (nrow(dropped_full) > 0) {
     warning(paste0(
-        nrow(dropped_bvq), " run(s) have dropped_packets_burst_virtual_queue > 0 ",
-        "(total dropped: ", sum(dropped_bvq$dropped_packets_burst_virtual_queue), ")"
+        nrow(dropped_full), " run(s) have dropped_packets_buffer_full > 0 ",
+        "(dropped because the buffer was full, total dropped: ", sum(dropped_full$dropped_packets_buffer_full), "). ",
+        "These are not valid runs; re-run them with a larger buffer_capacity"
     ))
 }
 
@@ -119,8 +118,10 @@ df_aggregated <- df %>%
         delay_deviation_pct_sd = sd(delay_deviation_pct),
         jitter_deviation_pct_avg = mean(jitter_deviation_pct),
         jitter_deviation_pct_sd = sd(jitter_deviation_pct),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         n_runs = n(),
         .groups = "drop"
     ) %>%
@@ -158,9 +159,12 @@ base_theme <- theme_minimal() +
         axis.line = element_line(),
         axis.ticks = element_line(),
         legend.position = "bottom",
-        legend.text = element_text(size = font_size),
-        legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        legend.location = "plot",
+        legend.text = element_text(size = font_size, margin = margin(l = 8)),
+        legend.title = element_text(size = font_size, face = "italic", margin = margin(r = 8)),
+        legend.key.spacing.x = unit(10, "pt"),
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -199,7 +203,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Mean delay deviation (%)",
+            y = "Mean delay\ndeviation (%)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -232,7 +236,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Jitter deviation (%)",
+            y = "Jitter\ndeviation (%)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -265,7 +269,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Passage time (ms)",
+            y = "Passage time\n(ms)",
             color = expression(t[h]),
             shape = "Jitter"
         )
@@ -274,7 +278,7 @@ for (dist in distributions) {
         file = paste0("half_life_delay_", dist, ".pdf"),
         plot = plot_delay & legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_delay_", dist, ".pdf\n"))
 
@@ -282,7 +286,7 @@ for (dist in distributions) {
         file = paste0("half_life_jitter_", dist, ".pdf"),
         plot = plot_jitter & legend_theme,
         device = cairo_pdf,
-        width = 10, height = 5
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_jitter_", dist, ".pdf\n"))
 
@@ -290,7 +294,7 @@ for (dist in distributions) {
         file = paste0("half_life_passage_time_", dist, ".pdf"),
         plot = plot_passage_time & legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6.6
     )
     cat(paste0("\nPlot saved as: half_life_passage_time_", dist, ".pdf\n"))
 }

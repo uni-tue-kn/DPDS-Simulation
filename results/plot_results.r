@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 library(ggplot2)
+source("center_x_title.r")
 library(magrittr)
 library(dplyr)
 library(scales)
@@ -15,9 +16,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.3
 
@@ -30,10 +31,7 @@ df <- data.frame(
     rate_config = character(),
     rate_numeric = numeric(),
     delay_mean_ns = numeric(),
-    delay_std_ns = numeric(),
-    inter_arrival_time_mean_ns = numeric(),
-    inter_arrival_time_std_ns = numeric(),
-    tracked_packets = numeric()
+    delay_std_ns = numeric()
 )
 
 # Read all CSV files
@@ -78,36 +76,37 @@ df$jitter_config <- factor(df$jitter_config,
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     run_details <- paste(
-        apply(dropped_bw, 1, function(r) paste0(
+        apply(dropped_lim, 1, function(r) paste0(
             "  ", r["prefix"], "/", r["distribution"], "/", r["delay_config"], "/",
             r["jitter_config"], "/", r["rate_config"],
-            " (dropped: ", r["dropped_packets_bandwidth"], ")"
+            " (dropped: ", r["dropped_packets_limiter"], ")"
         )),
         collapse = "\n"
     )
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), "):\n",
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), "):\n",
         run_details
     ))
 }
 
-dropped_bvq <- df %>% filter(dropped_packets_burst_virtual_queue > 0)
-if (nrow(dropped_bvq) > 0) {
+dropped_full <- df %>% filter(dropped_packets_buffer_full > 0)
+if (nrow(dropped_full) > 0) {
     run_details <- paste(
-        apply(dropped_bvq, 1, function(r) paste0(
+        apply(dropped_full, 1, function(r) paste0(
             "  ", r["prefix"], "/", r["distribution"], "/", r["delay_config"], "/",
             r["jitter_config"], "/", r["rate_config"],
-            " (dropped: ", r["dropped_packets_burst_virtual_queue"], ")"
+            " (dropped: ", r["dropped_packets_buffer_full"], ")"
         )),
         collapse = "\n"
     )
     warning(paste0(
-        nrow(dropped_bvq), " run(s) have dropped_packets_burst_virtual_queue > 0 ",
-        "(total dropped: ", sum(dropped_bvq$dropped_packets_burst_virtual_queue), "):\n",
+        nrow(dropped_full), " run(s) have dropped_packets_buffer_full > 0 ",
+        "(dropped because the buffer was full, total dropped: ", sum(dropped_full$dropped_packets_buffer_full), "). ",
+        "These are not valid runs; re-run them with a larger buffer_capacity:\n",
         run_details
     ))
 }
@@ -118,10 +117,7 @@ df <- df %>%
         configured_delay_ns = as.numeric(gsub("ms", "", delay_config)) * 1e6,
         configured_jitter_ns = as.numeric(gsub("ms", "", as.character(jitter_config))) * 1e6,
         delay_deviation_pct = (delay_mean_ns - configured_delay_ns) / configured_delay_ns * 100,
-        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100,
-        theoretical_iat_ns = (1538 * 8) / rate_numeric,
-        iat_deviation_pct = (inter_arrival_time_mean_ns - theoretical_iat_ns) / theoretical_iat_ns * 100,
-        iat_cvar = inter_arrival_time_std_ns / inter_arrival_time_mean_ns
+        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100
     )
 
 # Aggregate statistics: calculate mean and standard deviation across all runs
@@ -132,32 +128,20 @@ df_aggregated <- df %>%
         delay_mean_ns_sd = sd(delay_mean_ns),
         delay_std_ns_avg = mean(delay_std_ns),
         delay_std_ns_sd = sd(delay_std_ns),
-        inter_arrival_time_mean_ns_avg = mean(inter_arrival_time_mean_ns),
-        inter_arrival_time_mean_ns_sd = sd(inter_arrival_time_mean_ns),
-        inter_arrival_time_std_ns_avg = mean(inter_arrival_time_std_ns),
-        inter_arrival_time_std_ns_sd = sd(inter_arrival_time_std_ns),
         kendall_tau_distance_div_n_avg = mean(kendall_tau_distance_div_n),
         kendall_tau_distance_div_n_sd = sd(kendall_tau_distance_div_n),
         out_of_order_packets_avg = mean(out_of_order_packets),
         out_of_order_packets_sd = sd(out_of_order_packets),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
-        measured_passage_time_mean_ns_avg = mean(measured_passage_time_mean_ns),
-        measured_passage_time_mean_ns_sd = sd(measured_passage_time_mean_ns),
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         delay_deviation_pct_avg = mean(delay_deviation_pct),
         delay_deviation_pct_sd = sd(delay_deviation_pct),
         jitter_deviation_pct_avg = mean(jitter_deviation_pct),
         jitter_deviation_pct_sd = sd(jitter_deviation_pct),
-        iat_deviation_pct_avg = mean(iat_deviation_pct),
-        iat_deviation_pct_sd = sd(iat_deviation_pct),
-        iat_cvar_avg = mean(iat_cvar),
-        iat_cvar_sd = sd(iat_cvar),
-        dropped_packets_bandwidth_avg = mean(dropped_packets_bandwidth),
-        dropped_packets_bandwidth_sd = sd(dropped_packets_bandwidth),
-        burst_spacing_offset_mean_ns_avg = mean(burst_spacing_offset_mean_ns),
-        burst_spacing_offset_mean_ns_sd = sd(burst_spacing_offset_mean_ns),
-        burst_spacing_offset_max_ns_avg = mean(burst_spacing_offset_max_ns),
-        burst_spacing_offset_max_ns_sd = sd(burst_spacing_offset_max_ns),
+        dropped_packets_limiter_avg = mean(dropped_packets_limiter),
+        dropped_packets_limiter_sd = sd(dropped_packets_limiter),
         n_runs = n(),
         .groups = "drop"
     )
@@ -167,19 +151,12 @@ df_aggregated <- df_aggregated %>%
     mutate(
         delay_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (delay_mean_ns_sd / sqrt(n_runs)),
         delay_std_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (delay_std_ns_sd / sqrt(n_runs)),
-        inter_arrival_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (inter_arrival_time_mean_ns_sd / sqrt(n_runs)),
-        inter_arrival_time_std_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (inter_arrival_time_std_ns_sd / sqrt(n_runs)),
         kendall_tau_distance_div_n_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (kendall_tau_distance_div_n_sd / sqrt(n_runs)),
         out_of_order_packets_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (out_of_order_packets_sd / sqrt(n_runs)),
         theoretical_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (theoretical_passage_time_mean_ns_sd / sqrt(n_runs)),
-        measured_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (measured_passage_time_mean_ns_sd / sqrt(n_runs)),
         delay_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (delay_deviation_pct_sd / sqrt(n_runs)),
         jitter_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_pct_sd / sqrt(n_runs)),
-        iat_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (iat_deviation_pct_sd / sqrt(n_runs)),
-        iat_cvar_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (iat_cvar_sd / sqrt(n_runs)),
-        dropped_packets_bandwidth_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (dropped_packets_bandwidth_sd / sqrt(n_runs)),
-        burst_spacing_offset_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (burst_spacing_offset_mean_ns_sd / sqrt(n_runs)),
-        burst_spacing_offset_max_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (burst_spacing_offset_max_ns_sd / sqrt(n_runs))
+        dropped_packets_limiter_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (dropped_packets_limiter_sd / sqrt(n_runs))
     )
 
 ##################################################################################################
@@ -231,9 +208,12 @@ base_theme <- theme_minimal() +
         axis.line = element_line(),
         axis.ticks = element_line(),
         legend.position = "bottom",
-        legend.text = element_text(size = font_size),
-        legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        legend.location = "plot",
+        legend.text = element_text(size = font_size, margin = margin(l = 8)),
+        legend.title = element_text(size = font_size, face = "italic", margin = margin(r = 8)),
+        legend.key.spacing.x = unit(10, "pt"),
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -269,7 +249,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Mean delay deviation (%)",
+            y = "Mean delay\ndeviation (%)",
             color = "Configuration",
             shape = "Jitter"
         )
@@ -303,7 +283,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Jitter deviation (%)",
+            y = "Jitter\ndeviation (%)",
             color = "Configuration",
             shape = "Jitter"
         )
@@ -321,17 +301,17 @@ for (dist in distributions) {
 
         ggsave(
             file = paste0("combined_delay_", dist, "_", group_info$suffix, ".pdf"),
-            plot = (plot_delay + group_info$data) & legend_theme & extra_guides,
+            plot = (plot_delay %+% group_info$data) & legend_theme & extra_guides,
             device = cairo_pdf,
-            width = 12, height = 5
+            width = 14.4, height = 6
         )
         cat(paste0("\nPlot saved as: combined_delay_", dist, "_", group_info$suffix, ".pdf\n"))
 
         ggsave(
             file = paste0("combined_jitter_", dist, "_", group_info$suffix, ".pdf"),
-            plot = (plot_jitter + group_info$data) & legend_theme & extra_guides,
+            plot = (plot_jitter %+% group_info$data) & legend_theme & extra_guides,
             device = cairo_pdf,
-            width = 12, height = 5
+            width = 14.4, height = 6
         )
         cat(paste0("\nPlot saved as: combined_jitter_", dist, "_", group_info$suffix, ".pdf\n"))
     }

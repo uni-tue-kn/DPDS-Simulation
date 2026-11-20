@@ -11,7 +11,7 @@
 //! repeated 10 times so the throughput numbers carry statistical significance.
 //!
 //! Usage:
-//!   dpds_sampling_benchmark [N_SAMPLES] [RUNS]
+//!   dpds_benchmark [N_SAMPLES] [RUNS]
 //!
 //! N_SAMPLES defaults to 1000000000 and RUNS to 10. The optional arguments exist
 //! only for quick sanity runs with smaller counts.
@@ -89,8 +89,9 @@ fn main() {
         for run in 0..runs {
             pb.set_message(format!("{name} run {}/{}", run + 1, runs));
 
-            // Correlation off: rate is irrelevant to generation speed, so pass 0.
-            let mut delayer = Delayer::new(distribution, MEAN_NS, STD_NS, false, 0., 0.);
+            // Correlation off: the rate does not affect generation speed, but
+            // dpds-core rejects rates below 1 pps, so pass the minimum.
+            let mut delayer = Delayer::new(distribution, MEAN_NS, STD_NS, false, 0., 1.);
 
             // Sum the samples and black_box them so the loop cannot be optimized away.
             let start = Instant::now();

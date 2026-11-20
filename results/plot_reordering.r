@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 library(ggplot2)
+source("center_x_title.r")
 library(magrittr)
 library(dplyr)
 library(scales)
@@ -14,9 +15,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.3
 
@@ -67,7 +68,6 @@ df_ktau_reorder <- read_dataset("reorder_kendalltau", "reorder")
 df_ktau_corr <- df_ktau_reorder %>%
     mutate(
         prefix = "correlation30",
-        kendall_tau_distance = 0,
         kendall_tau_distance_div_n = 0
     )
 df_ktau_raw <- rbind(df_ktau_reorder, df_ktau_corr)
@@ -138,9 +138,12 @@ base_theme <- theme_minimal() +
         axis.line = element_line(),
         axis.ticks = element_line(),
         legend.position = "bottom",
-        legend.text = element_text(size = font_size),
-        legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        legend.location = "plot",
+        legend.text = element_text(size = font_size, margin = margin(l = 8)),
+        legend.title = element_text(size = font_size, face = "italic", margin = margin(r = 8)),
+        legend.key.spacing.x = unit(10, "pt"),
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -187,7 +190,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Out-of-order packets",
+            y = "Out-of-order\npackets",
             color = "Configuration",
             shape = "Jitter"
         )
@@ -196,7 +199,7 @@ for (dist in distributions) {
         file = paste0("combined_ooo_", dist, "_reordered_correlated.pdf"),
         plot = plot_ooo + legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: combined_ooo_", dist, "_reordered_correlated.pdf\n"))
 
@@ -237,7 +240,7 @@ for (dist in distributions) {
         base_theme +
         labs(
             x = "Rate (Gbit/s)",
-            y = "Swaps per packet",
+            y = "Swaps per\npacket",
             color = "Configuration",
             shape = "Jitter"
         )
@@ -246,7 +249,7 @@ for (dist in distributions) {
         file = paste0("combined_ktau_", dist, "_reordered_correlated.pdf"),
         plot = plot_ktau + legend_theme,
         device = cairo_pdf,
-        width = 12, height = 5
+        width = 14.4, height = 6
     )
     cat(paste0("\nPlot saved as: combined_ktau_", dist, "_reordered_correlated.pdf\n"))
 }

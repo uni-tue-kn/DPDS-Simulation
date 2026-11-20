@@ -1,0 +1,332 @@
+//! End-to-end tests of the `dpds_simulation` binary (sweep driver) and of the
+//! release profile. They only use the CSV files the binary writes.
+//!
+//! Spec requirements covered: one CSV per config, header + one row per run,
+//! rows sorted by run index, results independent of the worker count
+//! (`MAX_CONCURRENT_SIMULATIONS`, fixed seed => byte-identical files), the
+//! slim CSV header, the release profile in `Cargo.toml`, and static
+//! checks of the repository (dependencies, README). The
+//! checkpoint/resume behaviour is tested in `checkpoint_cli.rs`.
+
+mod common;
+
+use common::{read_csv, run_sweep};
+use lib::results::QUANTILE_PROBABILITIES;
+use std::fs;
+
+const RUNS: u32 = 7;
+
+/// Three small configs (different features) with a fixed seed. `seed` is
+/// ignored by the pre-redesign binary (unknown JSON fields are skipped).
+fn configs_json() -> String {
+    format!(
+        r#"[
+  {{"simulation_config": {{"duration_s": 0.0004, "runs": {RUNS}, "rate_gbps": 1.2,
+      "average_frame_size_byte": 1480, "activate_reordering": false,
+      "csv_output_path": "a_fifo.csv", "seed": 100}},
+    "delay_config": {{"mean_ns": 100000, "std_ns": 30000, "rv_distribution": "NormalDistribution",
+      "activate_correlation": false, "half_life_period_ns": 0}}}},
+  {{"simulation_config": {{"duration_s": 0.0004, "runs": {RUNS}, "rate_gbps": 1.2,
+      "average_frame_size_byte": 1480, "activate_reordering": true,
+      "csv_output_path": "b_reorder.csv", "seed": 200}},
+    "delay_config": {{"mean_ns": 100000, "std_ns": 30000, "rv_distribution": "NormalDistribution",
+      "activate_correlation": false, "half_life_period_ns": 0}}}},
+  {{"simulation_config": {{"duration_s": 0.0004, "runs": {RUNS}, "rate_gbps": 1.2,
+      "average_frame_size_byte": 1480, "activate_reordering": false,
+      "csv_output_path": "c_spacer.csv", "seed": 300}},
+    "delay_config": {{"mean_ns": 100000, "std_ns": 30000, "rv_distribution": "UniformDistribution",
+      "activate_correlation": false, "half_life_period_ns": 0}},
+    "limiter_config": {{"mode": "Spacer", "rate_bps": 800000000}}}}
+]"#
+    )
+}
+
+const FILES: [&str; 3] = ["a_fifo.csv", "b_reorder.csv", "c_spacer.csv"];
+
+/// The result CSVs and the quantile files next to them.
+const ALL_FILES: [&str; 6] = [
+    "a_fifo.csv",
+    "a_fifo_quantiles.csv",
+    "b_reorder.csv",
+    "b_reorder_quantiles.csv",
+    "c_spacer.csv",
+    "c_spacer_quantiles.csv",
+];
+
+/// The result columns: only those that feed a PDF.
+const EXPECTED_HEADER: [&str; 8] = [
+    "run",
+    "delay_mean_ns",
+    "delay_std_ns",
+    "kendall_tau_distance_div_n",
+    "out_of_order_packets",
+    "theoretical_passage_time_mean_ns",
+    "dropped_packets_limiter",
+    "dropped_packets_buffer_full",
+];
+
+#[test]
+fn every_config_gets_its_own_complete_csv() {
+    let results = run_sweep("driver-complete", &configs_json(), Some("3"));
+    for file in FILES {
+        let (header, rows) = read_csv(&results.join(file));
+        assert_eq!(rows.len(), RUNS as usize, "{file}");
+        for row in &rows {
+            assert_eq!(row.len(), header.len(), "{file}: row shape");
+        }
+        // one row per (run, probability), sorted by run, then probability
+        let quantiles = file.replace(".csv", "_quantiles.csv");
+        let (header, rows) = read_csv(&results.join(&quantiles));
+        assert_eq!(header, ["run", "probability", "delay_ns"], "{quantiles}");
+        let keys: Vec<(u32, f64)> = rows
+            .iter()
+            .map(|r| (r[0].parse().unwrap(), r[1].parse().unwrap()))
+            .collect();
+        let expected: Vec<(u32, f64)> = (0..RUNS)
+            .flat_map(|run| QUANTILE_PROBABILITIES.iter().map(move |&p| (run, p)))
+            .collect();
+        assert_eq!(keys, expected, "{quantiles}");
+        for (i, row) in rows.iter().enumerate() {
+            row[2]
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{quantiles} row {i}"));
+        }
+    }
+}
+
+#[test]
+fn csv_header_has_exactly_the_plotted_columns() {
+    let results = run_sweep("driver-header", &configs_json(), Some("2"));
+    for file in FILES {
+        let (header, _) = read_csv(&results.join(file));
+        assert_eq!(header, EXPECTED_HEADER, "{file}");
+    }
+}
+
+#[test]
+fn rows_are_sorted_by_run_index_for_any_worker_count() {
+    for workers in ["1", "3", "8"] {
+        let results = run_sweep(
+            &format!("driver-sorted-{workers}"),
+            &configs_json(),
+            Some(workers),
+        );
+        for file in FILES {
+            let (_, rows) = read_csv(&results.join(file));
+            let runs: Vec<u32> = rows.iter().map(|r| r[0].parse().unwrap()).collect();
+            assert_eq!(
+                runs,
+                (0..RUNS).collect::<Vec<_>>(),
+                "{file} with {workers} workers"
+            );
+        }
+    }
+}
+
+#[test]
+fn seeded_results_do_not_depend_on_the_worker_count() {
+    // 1 worker vs 3 workers vs default vs more workers than jobs must produce
+    // byte-identical files.
+    let reference = run_sweep("driver-w1", &configs_json(), Some("1"));
+    for (name, workers) in [
+        ("driver-w3", Some("3")),
+        ("driver-w64", Some("64")),
+        ("driver-wdefault", None),
+    ] {
+        let other = run_sweep(name, &configs_json(), workers);
+        for file in ALL_FILES {
+            let a = fs::read_to_string(reference.join(file)).unwrap();
+            let b = fs::read_to_string(other.join(file)).unwrap();
+            assert_eq!(a, b, "{file}: {name} differs from 1 worker");
+        }
+    }
+}
+
+#[test]
+fn invalid_max_concurrent_simulations_falls_back_to_the_default() {
+    // An unparsable value is ignored (as before); the sweep still completes
+    // and, being seeded, gives the same files as the default.
+    let invalid = run_sweep("driver-invalid-env", &configs_json(), Some("not-a-number"));
+    let default = run_sweep("driver-default-env", &configs_json(), None);
+    for file in ALL_FILES {
+        let (_, rows) = read_csv(&invalid.join(file));
+        assert!(!rows.is_empty(), "{file}");
+        assert_eq!(
+            fs::read_to_string(invalid.join(file)).unwrap(),
+            fs::read_to_string(default.join(file)).unwrap(),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn different_seeds_per_run_give_different_rows() {
+    // Run r uses seed + r, so the 7 rows of a config are not copies. (Passes
+    // vacuously before the redesign because runs are unseeded there.)
+    let results = run_sweep("driver-run-seeds", &configs_json(), Some("2"));
+    let (_, rows) = read_csv(&results.join("a_fifo.csv"));
+    let mut distinct: Vec<&Vec<String>> = Vec::new();
+    for row in &rows {
+        // compare everything except the run index
+        if !distinct.iter().any(|d| d[1..] == row[1..]) {
+            distinct.push(row);
+        }
+    }
+    assert!(
+        distinct.len() > 1,
+        "all runs identical: seed + r not applied"
+    );
+}
+
+#[test]
+fn release_profile_has_lto_single_codegen_unit_and_abort() {
+    let manifest = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let section = manifest
+        .split("[profile.release]")
+        .nth(1)
+        .expect("[profile.release] section missing")
+        .split("\n[")
+        .next()
+        .unwrap()
+        .replace(' ', "");
+    assert!(section.contains("lto=\"fat\""), "{section}");
+    assert!(section.contains("codegen-units=1"), "{section}");
+    assert!(section.contains("panic=\"abort\""), "{section}");
+}
+
+// ------------------------------------------------------------ static checks
+
+fn read_repo_file(relative: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+#[test]
+fn worker_pool_and_signals_use_rayon_and_signal_hook_or_ctrlc_without_tokio() {
+    let manifest = read_repo_file("Cargo.toml");
+    let dependencies = manifest
+        .split("[dependencies]")
+        .nth(1)
+        .expect("[dependencies] section")
+        .split("\n[")
+        .next()
+        .unwrap();
+    let has = |name: &str| {
+        dependencies
+            .lines()
+            .any(|l| l.trim_start().starts_with(&format!("{name} =")))
+    };
+    assert!(has("rayon"), "rayon must be a dependency:\n{dependencies}");
+    assert!(
+        has("signal-hook") || has("ctrlc"),
+        "signal-hook or ctrlc must be a dependency:\n{dependencies}"
+    );
+    assert!(!has("tokio"), "the work is CPU-bound: no tokio");
+}
+
+#[test]
+fn readme_documents_the_checkpoint_flags_and_the_buffer_capacity_default() {
+    let readme = read_repo_file("README.md");
+    for needle in [
+        "--resume",
+        "--fresh",
+        "--dry-run",
+        "--stop-at",
+        "--start-at",
+        ".checkpoint.json",
+        "2^26",
+    ] {
+        assert!(readme.contains(needle), "README must mention {needle}");
+    }
+    // M2: the default is 2^26 = 67108864 everywhere, never the former 2^21
+    let example = readme
+        .lines()
+        .find(|l| l.contains("\"buffer_capacity\":"))
+        .expect("README config example shows buffer_capacity");
+    assert!(example.contains("2^26"), "{example}");
+    assert!(example.contains("67108864"), "{example}");
+    assert!(
+        !example.contains("2^21") && !example.contains("2097152"),
+        "{example}"
+    );
+    let section = readme
+        .split("### Buffer capacity")
+        .nth(1)
+        .expect("README has a Buffer capacity section")
+        .split("\n#")
+        .next()
+        .unwrap();
+    assert!(section.contains("2^26"), "{section}");
+    assert!(
+        !section.contains("2^20") && !section.contains("2^24"),
+        "{section}"
+    );
+    for line in readme.lines() {
+        assert!(!line.contains("2^20"), "stale 2^20: {line}");
+        // the old default may only be named as the one that was replaced
+        assert!(
+            !line.contains("2^24") || line.contains("instead of 2^24"),
+            "stale 2^24: {line}"
+        );
+    }
+}
+
+#[test]
+fn readme_does_not_mention_limit_bit_and_explains_the_derived_limit() {
+    // dpds-core removed `LimiterConfig.limit_bit`: the limit of both limiter
+    // modes is `buffer_capacity * 1538 * 8` bit (derived_limit_bit).
+    let readme = read_repo_file("README.md");
+    for (n, line) in readme.lines().enumerate() {
+        assert!(
+            !line.contains("limit_bit"),
+            "README line {}: stale limit_bit: {line}",
+            n + 1
+        );
+    }
+    assert!(
+        readme.contains("1538"),
+        "README must state the derived limit (buffer_capacity * 1538 * 8 bit)"
+    );
+}
+
+#[test]
+fn a_config_with_limit_bit_makes_the_binary_fail_naming_the_key() {
+    let dir = std::env::temp_dir()
+        .join("dpds-simulation-tests")
+        .join(format!("limit-bit-rejected-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("simulation_configs.json"),
+        r#"[{"simulation_config": {"duration_s": 0.0004, "runs": 1, "rate_gbps": 1.2,
+      "average_frame_size_byte": 1480, "activate_reordering": false,
+      "csv_output_path": "stale.csv", "seed": 1},
+    "limiter_config": {"mode": "Spacer", "rate_bps": 800000000, "limit_bit": 1000000}}]"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dpds_simulation"))
+        .current_dir(&dir)
+        .output()
+        .expect("spawn dpds_simulation");
+    assert!(
+        !output.status.success(),
+        "a stale limit_bit must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("limit_bit"), "{stderr}");
+    assert!(!dir.join("results").join("stale.csv").exists());
+}
+
+#[test]
+fn worker_cpu_maps_workers_onto_the_allowed_cpus_in_order_and_wraps_around() {
+    // CPU numbers, not positions: an allowed set like `taskset -c 1,4,6`.
+    let allowed = [1, 4, 6];
+    let cpus: Vec<usize> = (0..7)
+        .map(|worker| lib::affinity::worker_cpu(&allowed, worker))
+        .collect();
+    assert_eq!(cpus, [1, 4, 6, 1, 4, 6, 1]);
+    // a single allowed CPU takes every worker
+    assert!((0..5).all(|w| lib::affinity::worker_cpu(&[3], w) == 3));
+    // far more workers than CPUs still lands in the set
+    assert!((0..1000).all(|w| allowed.contains(&lib::affinity::worker_cpu(&allowed, w))));
+}

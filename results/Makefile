@@ -2,7 +2,7 @@
 #
 # Usage:
 #   make            # run all scripts sequentially
-#   make plot_memory.r   # run a single script
+#   make plot_delays.r   # run a single script
 #   make clean      # remove generated PDFs and aggregated CSVs
 
 RSCRIPT ?= Rscript

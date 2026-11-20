@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 library(ggplot2)
+source("center_x_title.r")
 library(magrittr)
 library(dplyr)
 library(scales)
@@ -15,9 +16,9 @@ rates <- c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps")
 distributions <- c("normal", "uniform", "gamma", "lognormal")
 
 # Plot parameters
-font_size <- 16
-line_size <- 1
-point_size <- 4
+font_size <- 34.9
+line_size <- 2.2
+point_size <- 7.0
 conf_alpha <- 0.05
 geom_errorbar_width <- 0.7
 
@@ -30,10 +31,7 @@ df <- data.frame(
     rate_config = character(),
     rate_numeric = numeric(),
     delay_mean_ns = numeric(),
-    delay_std_ns = numeric(),
-    inter_arrival_time_mean_ns = numeric(),
-    inter_arrival_time_std_ns = numeric(),
-    tracked_packets = numeric()
+    delay_std_ns = numeric()
 )
 
 # Read all CSV files
@@ -81,26 +79,27 @@ df$jitter_config <- factor(df$jitter_config,
 )
 
 df$delay_config <- factor(df$delay_config,
-    levels = c("3ms", "10ms", "30ms", "100ms"),
-    labels = c("3 ms", "10 ms", "30 ms", "100 ms")
+    levels = c("3ms", "10ms", "30ms"),
+    labels = c("3 ms", "10 ms", "30 ms")
 )
 
 ##################################################################################################
 # Sanity checks: warn if any packets were dropped
 
-dropped_bw <- df %>% filter(dropped_packets_bandwidth > 0)
-if (nrow(dropped_bw) > 0) {
+dropped_lim <- df %>% filter(dropped_packets_limiter > 0)
+if (nrow(dropped_lim) > 0) {
     warning(paste0(
-        nrow(dropped_bw), " run(s) have dropped_packets_bandwidth > 0 ",
-        "(total dropped: ", sum(dropped_bw$dropped_packets_bandwidth), ")"
+        nrow(dropped_lim), " run(s) have dropped_packets_limiter > 0 ",
+        "(total dropped: ", sum(dropped_lim$dropped_packets_limiter), ")"
     ))
 }
 
-dropped_bvq <- df %>% filter(dropped_packets_burst_virtual_queue > 0)
-if (nrow(dropped_bvq) > 0) {
+dropped_full <- df %>% filter(dropped_packets_buffer_full > 0)
+if (nrow(dropped_full) > 0) {
     warning(paste0(
-        nrow(dropped_bvq), " run(s) have dropped_packets_burst_virtual_queue > 0 ",
-        "(total dropped: ", sum(dropped_bvq$dropped_packets_burst_virtual_queue), ")"
+        nrow(dropped_full), " run(s) have dropped_packets_buffer_full > 0 ",
+        "(dropped because the buffer was full, total dropped: ", sum(dropped_full$dropped_packets_buffer_full), "). ",
+        "These are not valid runs; re-run them with a larger buffer_capacity"
     ))
 }
 
@@ -112,10 +111,7 @@ df <- df %>%
         delay_deviation_ms = (delay_mean_ns - configured_delay_ns) / 1e6,
         jitter_deviation_ms = (delay_std_ns - configured_jitter_ns) / 1e6,
         delay_deviation_pct = (delay_mean_ns - configured_delay_ns) / configured_delay_ns * 100,
-        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100,
-        theoretical_iat_ns = (1538 * 8) / rate_numeric,
-        iat_deviation_pct = (inter_arrival_time_mean_ns - theoretical_iat_ns) / theoretical_iat_ns * 100,
-        iat_cvar = inter_arrival_time_std_ns / inter_arrival_time_mean_ns
+        jitter_deviation_pct = (delay_std_ns - configured_jitter_ns) / configured_jitter_ns * 100
     )
 
 # Aggregate statistics: calculate mean and standard deviation across all runs
@@ -126,14 +122,11 @@ df_aggregated <- df %>%
         delay_mean_ns_sd = sd(delay_mean_ns),
         delay_std_ns_avg = mean(delay_std_ns),
         delay_std_ns_sd = sd(delay_std_ns),
-        inter_arrival_time_mean_ns_avg = mean(inter_arrival_time_mean_ns),
-        inter_arrival_time_mean_ns_sd = sd(inter_arrival_time_mean_ns),
-        inter_arrival_time_std_ns_avg = mean(inter_arrival_time_std_ns),
-        inter_arrival_time_std_ns_sd = sd(inter_arrival_time_std_ns),
-        theoretical_passage_time_mean_ns_avg = mean(theoretical_passage_time_mean_ns),
-        theoretical_passage_time_mean_ns_sd = sd(theoretical_passage_time_mean_ns),
-        measured_passage_time_mean_ns_avg = mean(measured_passage_time_mean_ns),
-        measured_passage_time_mean_ns_sd = sd(measured_passage_time_mean_ns),
+        # A run that never crossed both thresholds reports 0 ("no passage observed", not 0 ns). The passage
+        # time of a configuration is N/A unless every run observed a passage: the rest would underestimate it.
+        passage_runs = sum(theoretical_passage_time_mean_ns > 0),
+        theoretical_passage_time_mean_ns_avg = if (all(theoretical_passage_time_mean_ns > 0)) mean(theoretical_passage_time_mean_ns) else NA_real_,
+        theoretical_passage_time_mean_ns_sd = if (all(theoretical_passage_time_mean_ns > 0)) sd(theoretical_passage_time_mean_ns) else NA_real_,
         delay_deviation_ms_avg = mean(delay_deviation_ms),
         delay_deviation_ms_sd = sd(delay_deviation_ms),
         jitter_deviation_ms_avg = mean(jitter_deviation_ms),
@@ -142,12 +135,8 @@ df_aggregated <- df %>%
         delay_deviation_pct_sd = sd(delay_deviation_pct),
         jitter_deviation_pct_avg = mean(jitter_deviation_pct),
         jitter_deviation_pct_sd = sd(jitter_deviation_pct),
-        iat_deviation_pct_avg = mean(iat_deviation_pct),
-        iat_deviation_pct_sd = sd(iat_deviation_pct),
-        iat_cvar_avg = mean(iat_cvar),
-        iat_cvar_sd = sd(iat_cvar),
-        dropped_packets_bandwidth_avg = mean(dropped_packets_bandwidth),
-        dropped_packets_bandwidth_sd = sd(dropped_packets_bandwidth),
+        dropped_packets_limiter_avg = mean(dropped_packets_limiter),
+        dropped_packets_limiter_sd = sd(dropped_packets_limiter),
         n_runs = n(),
         .groups = "drop"
     )
@@ -159,8 +148,7 @@ df_aggregated <- df_aggregated %>%
         jitter_deviation_ms_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_ms_sd / sqrt(n_runs)),
         delay_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (delay_deviation_pct_sd / sqrt(n_runs)),
         jitter_deviation_pct_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (jitter_deviation_pct_sd / sqrt(n_runs)),
-        theoretical_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (theoretical_passage_time_mean_ns_sd / sqrt(n_runs)),
-        measured_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (measured_passage_time_mean_ns_sd / sqrt(n_runs))
+        theoretical_passage_time_mean_ns_ci = qt(1 - conf_alpha / 2, n_runs - 1) * (theoretical_passage_time_mean_ns_sd / sqrt(n_runs))
     )
 
 # Write the aggregated statistics to a CSV file
@@ -209,9 +197,12 @@ base_theme <- theme_minimal() +
         axis.line = element_line(),
         axis.ticks = element_line(),
         legend.position = "bottom",
-        legend.text = element_text(size = font_size),
-        legend.title = element_text(size = font_size, face = "italic"),
-        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5)
+        legend.location = "plot",
+        legend.text = element_text(size = font_size, margin = margin(l = 8)),
+        legend.title = element_text(size = font_size, face = "italic", margin = margin(r = 8)),
+        legend.key.spacing.x = unit(10, "pt"),
+        plot.title = element_text(size = font_size, face = "bold", hjust = 0.5),
+        plot.margin = margin(t = 25, r = 10, b = 5, l = 5)
     )
 
 legend_theme <- theme(legend.position = "bottom", legend.box = "vertical")
@@ -244,7 +235,7 @@ plot_delay <- ggplot(df_aggregated, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Mean delay deviation (%)",
+        y = "Mean delay\ndeviation (%)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -253,7 +244,7 @@ ggsave(
     file = "distributions_delay.pdf",
     plot = plot_delay,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_delay.pdf\n")
 
@@ -286,7 +277,7 @@ plot_jitter <- ggplot(df_aggregated, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Jitter deviation (%)",
+        y = "Jitter\ndeviation (%)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -295,21 +286,22 @@ ggsave(
     file = "distributions_jitter.pdf",
     plot = plot_jitter,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_jitter.pdf\n")
 
 # Plot 3: Theoretical Passage Time
-# Blank out configurations with no tracked passage times (mean == 0) by setting
-# them to NA: the point and its confidence interval are not drawn, but the row is
-# kept so the dodge slot stays reserved and the axes match the delay/jitter plots
-df_passage_time <- df_aggregated %>%
-    mutate(
-        theoretical_passage_time_mean_ns_avg = ifelse(
-            theoretical_passage_time_mean_ns_avg > 0,
-            theoretical_passage_time_mean_ns_avg, NA_real_
-        )
-    )
+# A configuration without a passage in every run has an N/A passage time (see the aggregation): its
+# point and confidence interval are not drawn, the dodge slot stays reserved.
+censored <- df_aggregated %>% filter(passage_runs < n_runs)
+if (nrow(censored) > 0) {
+    cat("\nPassage time N/A (not every run observed a passage within the simulated time):\n")
+    for (i in seq_len(nrow(censored))) {
+        r <- censored[i, ]
+        cat(sprintf("  %s, %s Gbit/s: %d of %d runs with a passage\n", r$distribution, r$rate_config, r$passage_runs, r$n_runs))
+    }
+}
+df_passage_time <- df_aggregated
 
 plot_passage_time <- ggplot(df_passage_time, aes(
     x = rate_x,
@@ -338,7 +330,7 @@ plot_passage_time <- ggplot(df_passage_time, aes(
     legend_theme +
     labs(
         x = "Rate (Gbit/s)",
-        y = "Passage time (ms)",
+        y = "Passage time\n(ms)",
         color = "Distribution",
         shape = "Distribution"
     )
@@ -347,12 +339,161 @@ ggsave(
     file = "distributions_passage_time.pdf",
     plot = plot_passage_time,
     device = cairo_pdf,
-    width = 12, height = 5
+    width = 14.4, height = 6
 )
 cat("\nPlot saved as: distributions_passage_time.pdf\n")
 
 ##################################################################################################
-# Plot 4: Sampling cost per distribution (benchmark_sampling.csv)
+# Plots 4 and 5: QQ and PP plot of the configured ("incoming") delay distribution against the
+# achieved ("outgoing") delay, from <stem>_quantiles.csv (run, probability, delay_ns).
+# Each file holds the empirical quantiles of the achieved delay per run; they are averaged over
+# the runs per probability.
+
+# The configured distribution, parameterised exactly as dpds-core does from the mean and the
+# standard deviation (crates/dpds-core/src/delayer.rs, Delayer::initialize_rv; rand_distr 0.6):
+#   Normal(mean, std)             -> qnorm / pnorm
+#   LogNormal::from_mean_cv(mean, cv = std / mean)
+#                                 -> sdlog^2 = ln(1 + cv^2), meanlog = ln(mean) - sdlog^2 / 2
+#   Gamma(shape = alpha, scale = beta) with alpha = (mean / std)^2, beta = std^2 / mean
+#                                 -> shape = alpha, scale = beta (a scale, not a rate)
+#   Uniform(mean -+ sqrt(3) * std) -> qunif / punif
+# The delayer clamps negative samples to 0 (Delayer::next_delay), hence max(0, .) for the Normal.
+# The CDF is evaluated at the (non-negative) empirical quantiles, so the clamp does not change it.
+mean_ms <- as.numeric(sub("ms", "", delays[1]))
+std_ms <- as.numeric(sub("us", "", jitters[1])) / 1000
+ln_sdlog <- sqrt(log(1 + (std_ms / mean_ms)^2))
+ln_meanlog <- log(mean_ms) - ln_sdlog^2 / 2
+gamma_shape <- (mean_ms / std_ms)^2
+gamma_scale <- std_ms^2 / mean_ms
+uniform_low <- mean_ms - sqrt(3) * std_ms
+uniform_high <- mean_ms + sqrt(3) * std_ms
+
+df_quantiles <- data.frame()
+for (prefix in prefixes) {
+    for (distribution in distributions) {
+        for (delay in delays) {
+            for (jitter in jitters) {
+                for (rate in rates) {
+                    filename <- paste0(prefix, "_", distribution, "_", delay, "_", jitter, "_", rate, "_quantiles.csv")
+                    if (file.exists(filename)) {
+                        data <- read.csv(filename) %>%
+                            group_by(probability) %>%
+                            summarise(delay_ms = mean(delay_ns) / 1e6, .groups = "drop")
+                        data$distribution <- distribution
+                        data$rate_config <- rate
+                        df_quantiles <- rbind(df_quantiles, data)
+                    } else {
+                        warning(paste("File not found:", filename))
+                    }
+                }
+            }
+        }
+    }
+}
+
+if (nrow(df_quantiles) > 0) {
+    p <- df_quantiles$probability
+    x <- df_quantiles$delay_ms
+    d <- df_quantiles$distribution
+    df_quantiles <- df_quantiles %>%
+        mutate(
+            theoretical_ms = case_when(
+                d == "normal" ~ pmax(0, qnorm(p, mean_ms, std_ms)),
+                d == "uniform" ~ qunif(p, uniform_low, uniform_high),
+                d == "gamma" ~ qgamma(p, shape = gamma_shape, scale = gamma_scale),
+                d == "lognormal" ~ qlnorm(p, ln_meanlog, ln_sdlog)
+            ),
+            theoretical_cdf = case_when(
+                d == "normal" ~ pnorm(x, mean_ms, std_ms),
+                d == "uniform" ~ punif(x, uniform_low, uniform_high),
+                d == "gamma" ~ pgamma(x, shape = gamma_shape, scale = gamma_scale),
+                d == "lognormal" ~ plnorm(x, ln_meanlog, ln_sdlog)
+            ),
+            distribution = factor(distribution,
+                levels = c("normal", "uniform", "gamma", "lognormal"),
+                labels = c("Normal", "Uniform", "Gamma", "Log-normal")
+            ),
+            rate_config = factor(rate_config,
+                levels = c("0.1Gbps", "1Gbps", "10Gbps", "100Gbps"),
+                labels = c("0.1", "1", "10", "100")
+            )
+        )
+
+    rate_colors <- c(
+        "0.1" = "#000000",
+        "1" = "#0072B2",
+        "10" = "#D55E00",
+        "100" = "#E69F00"
+    )
+
+    facet_theme <- theme(
+        strip.text = element_text(size = font_size, face = "bold"),
+        strip.clip = "off",
+        panel.spacing.x = unit(1.5, "lines")
+    )
+
+    # Plot 4: QQ plot (theoretical quantile on x, achieved quantile on y), one PDF per distribution
+    # because the paper includes them as sub-figures at half the column width. Each has its own
+    # axis range (the same on x and y): with a shared one the long log-normal tail would compress
+    # the other three distributions into a corner.
+    for (name in levels(df_quantiles$distribution)) {
+        df_qq <- df_quantiles[df_quantiles$distribution == name, ]
+        qq_limits <- range(df_qq$theoretical_ms, df_qq$delay_ms)
+        plot_qq <- ggplot(df_qq, aes(x = theoretical_ms, y = delay_ms, color = rate_config)) +
+            geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+            geom_point(size = point_size / 3) +
+            scale_x_continuous(limits = qq_limits) +
+            scale_y_continuous(limits = qq_limits) +
+            scale_color_manual(values = rate_colors, drop = FALSE) +
+            base_theme +
+            legend_theme +
+            # Narrow plot: the y-axis labels take a quarter of the width, so legend and x-axis title are
+            # centred below the panel (not on the whole figure as in the wide plots).
+            theme(
+                legend.title.position = "top", legend.title = element_text(hjust = 0.5),
+                legend.location = "panel"
+            ) +
+            guides(color = guide_legend(override.aes = list(size = point_size))) +
+            labs(
+                x = "Configured delay\nquantile (ms)",
+                y = "Achieved delay\nquantile (ms)",
+                color = "Rate (Gbit/s)"
+            )
+
+        filename <- paste0("distributions_qq_", gsub("-", "", tolower(name)), ".pdf")
+        ggplot2::ggsave(file = filename, plot = plot_qq, device = cairo_pdf, width = 7.2, height = 7.8)
+        cat("\nPlot saved as:", filename, "\n")
+    }
+
+    # Plot 5: PP plot (configured CDF at the achieved quantile on x, probability on y)
+    plot_pp <- ggplot(df_quantiles, aes(x = theoretical_cdf, y = probability, color = rate_config)) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+        geom_point(size = point_size / 3) +
+        facet_wrap(~distribution, nrow = 1) +
+        scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+        scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+        scale_color_manual(values = rate_colors) +
+        base_theme +
+        legend_theme +
+        facet_theme +
+        guides(color = guide_legend(override.aes = list(size = point_size))) +
+        labs(
+            x = "Configured CDF at\nachieved quantile",
+            y = "Probability",
+            color = "Rate (Gbit/s)"
+        )
+
+    ggsave(
+        file = "distributions_pp.pdf",
+        plot = plot_pp,
+        device = cairo_pdf,
+        width = 14.4, height = 6
+    )
+    cat("\nPlot saved as: distributions_pp.pdf\n")
+}
+
+##################################################################################################
+# Plot 6: Sampling cost per distribution (benchmark_sampling.csv)
 # How long (real wall-clock time) it takes to generate a single sample, with 95%
 # confidence intervals across the repeated benchmark runs.
 
@@ -401,24 +542,28 @@ if (file.exists(benchmark_file)) {
             width = geom_errorbar_width / 2,
             linewidth = line_size
         ) +
-        scale_y_continuous(labels = label_number(big.mark = " ")) +
+        # The value above each bar (above its error bar), in black.
+        geom_text(
+            aes(y = msamples_per_sec_avg + msamples_per_sec_ci, label = sprintf("%.0f", msamples_per_sec_avg)),
+            vjust = -0.4, size = 0.8 * font_size / .pt, color = "black"
+        ) +
+        scale_y_continuous(labels = label_number(big.mark = " "), expand = expansion(mult = c(0.05, 0.15))) +
         expand_limits(y = 0) +
         scale_fill_manual(values = distribution_colors) +
         scale_color_manual(values = distribution_colors) +
-        guides(color = "none") +
+        guides(color = "none", fill = "none") +
         base_theme +
-        legend_theme +
+        theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
         labs(
             x = "Distribution",
-            y = "Sample generation rate (million/s)",
-            fill = "Distribution"
+            y = "Sample generation\nrate (million/s)"
         )
 
     ggsave(
         file = "distributions_sampling_cost.pdf",
         plot = plot_sampling_cost,
         device = cairo_pdf,
-        width = 8, height = 5
+        width = 12, height = 8.4
     )
     cat("\nPlot saved as: distributions_sampling_cost.pdf\n")
 } else {

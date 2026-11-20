@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, nightly]
   pull_request:
 
 env:
@@ -18,6 +18,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Pinned so a new stable release can't turn CI red on an unchanged tree; bump deliberately.
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Cache cargo

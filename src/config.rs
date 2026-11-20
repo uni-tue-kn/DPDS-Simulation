@@ -1,5 +1,5 @@
 use crate::statistics::ReorderingMetric;
-use dpds_core::{delayer::RVDistribution, limiter::LimiterMode};
+use dpds_core::{delayer::RVDistribution, dropper::LossModel, limiter::LimiterMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +21,16 @@ pub struct SimulationConfig {
     pub csv_output_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reordering_metric: Option<ReorderingMetric>,
+    /// Capacity of the `dpds-core` buffer in packets (default: 2^26, large
+    /// enough not to bind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_capacity: Option<usize>,
+    /// Packet loss model of the `dpds-core` buffer (default: `Random(0.0)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_model: Option<LossModel>,
+    /// Base seed: run `r` is seeded with `seed + r` (default: OS entropy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,9 +42,11 @@ pub struct DelayConfig {
     pub half_life_period_ns: f64,
 }
 
+/// The limiter's limit is not configured: dpds-core derives it as
+/// `buffer_capacity * MAX_FRAME_WIRE_BYTES (1538) * 8` for both modes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimiterConfig {
     pub mode: LimiterMode,
     pub rate_bps: f64,
-    pub limit_bit: f64,
 }

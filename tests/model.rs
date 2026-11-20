@@ -1,0 +1,1515 @@
+//! Model tests of the redesigned simulation (spec v9): arrival queue +
+//! the real `dpds_core::buffer::Buffer`.
+//!
+//! # Test-facing API fixed by these tests
+//!
+//! ```text
+//! lib::simulation::run_simulation(config: &Config, run: u32) -> SimulationResults
+//! lib::simulation::run_simulation_traced<F: FnMut(&Departure)>(
+//!         config: &Config, run: u32, on_departure: F) -> SimulationResults
+//!     // `run_simulation` = traced with a no-op closure. The closure is called
+//!     // once per transmitted packet, in departure order.
+//! #[derive(Debug, Clone, Copy, PartialEq)]
+//! lib::simulation::Departure {
+//!     seq: u64,          // arrival index 0,1,2,..; counts EVERY arrival, so
+//!                        // dropped packets leave gaps
+//!     rx_time_ns: f64,   // `now` passed to push_outcome
+//!     send_time_ns: u64, // send time from pop_due_with_time (whole ns)
+//!     tx_time_ns: f64,   // simulation time of the transmit event (pop time)
+//! }
+//! lib::simulation::DEFAULT_BUFFER_CAPACITY: usize = 1 << 26
+//! lib::results::CSV_HEADER: [&str; 8] or &[&str]    // the 8 column names, see csv_header_is_exact
+//! lib::results::SimulationResults                   // only fields that feed a CSV column:
+//!     delay_mean_ns, delay_std_ns, kendall_tau_distance_div_n,
+//!     out_of_order_packets, theoretical_passage_time_mean_ns,
+//!     dropped_packets_limiter: u64   // sanity check: limiter rejections
+//!     dropped_packets_buffer_full: u64  // arrivals rejected as BufferFull (last CSV column)
+//! lib::config::SimulationConfig (all `#[serde(default, skip_serializing_if = "Option::is_none")]`)
+//!     + buffer_capacity: Option<usize>   // default (None): 2^26 (`DEFAULT_BUFFER_CAPACITY`)
+//!     + loss_model: Option<dpds_core::dropper::LossModel>  // None = Random(0.0)
+//!     + seed: Option<u64>                // Some(s): run r is seeded with s + r
+//! ```
+//! `write_to_csv(&self, &Arc<Mutex<Writer<File>>>, run: u32)` is unchanged.
+//!
+//! # Model rules the tests pin (decisions the spec left open, flagged)
+//!
+//! * Arrival k happens at `k * iat` with `iat = 1e9 / (rate_gbps*1e9 /
+//!   ((frame+20)*8))`; arrivals with `t <= duration_ns` (inclusive, as before)
+//!   are processed; afterwards the buffer is drained, so every accepted packet
+//!   departs.
+//! * `average_frame_size_byte` includes the 4-B FCS, like the arrival rate:
+//!   the length passed to `push_outcome` (DPDK's `pkt_len`, without FCS) is
+//!   `ceil(frame) - 4` (0 for frames below 4 B). dpds-core adds 4 (FCS) and
+//!   20 (L1) bytes: limiter size = `(ceil(frame) + 20) * 8` bit.
+//! * Pop at exact send times: `tx_time = max(clock, send_time)`; in FIFO mode a
+//!   packet blocked behind a later one leaves right after it (same instant).
+//! * TIE RULE at equal times: a transmit event at time t is processed BEFORE an
+//!   arrival at time t (so a buffer slot freed at t is usable by an arrival at
+//!   t). Pinned by `equal_time_transmit_is_processed_before_arrival_*`.
+//! * EVERY departure is tracked: the statistics' denominator (`div_n`) is the
+//!   number of departures. Drops are not reported, so tests derive them from
+//!   the trace (arrivals minus departures).
+//! * Theoretical passage time: tracker fed with the REAL send time the buffer
+//!   reports at pop (`Departure.send_time_ns`): `send_time_ns - rx_time` (u64
+//!   truncation included) at time rx, in arrival (seq) order, so departures
+//!   that come out of order are held until all earlier ones have departed.
+//!
+//! All hand-derived numbers below follow dpds-core `buffer.rs`/`limiter.rs`
+//! (b825fc6) and were cross-checked with an independent Python re-derivation.
+
+mod common;
+
+use common::{read_csv, run_sweep};
+use dpds_core::limiter::{Limiter, LimiterMode};
+use lib::config::Config;
+use lib::results::{CSV_HEADER, QUANTILE_PROBABILITIES, SimulationResults};
+use lib::simulation::{Departure, run_simulation, run_simulation_traced};
+use lib::statistics::PassageTimeTracker;
+use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::fs::File;
+use std::sync::{Arc, Mutex};
+
+// ------------------------------------------------------------------ fixtures
+
+/// Offered load: rate 1.2 Gbit/s, frame 1480 B -> 12000 bit on the wire ->
+/// iat = exactly 10000 ns (all quantities below are exact in binary floats).
+const IAT: f64 = 10_000.0;
+
+#[derive(Clone)]
+struct Scenario {
+    sim: Value,
+    delay: Option<Value>,
+    limiter: Option<Value>,
+}
+
+/// 0.001 s -> arrivals at 0, 10000, ..., 1_000_000 ns = 101 packets.
+fn scenario() -> Scenario {
+    Scenario {
+        sim: json!({
+            "duration_s": 0.001, "runs": 1, "rate_gbps": 1.2,
+            "average_frame_size_byte": 1480, "activate_reordering": false,
+            "csv_output_path": "unused.csv", "seed": 42
+        }),
+        delay: None,
+        limiter: None,
+    }
+}
+
+impl Scenario {
+    fn with(mut self, key: &str, value: Value) -> Self {
+        self.sim[key] = value;
+        self
+    }
+    fn reorder(self, on: bool) -> Self {
+        self.with("activate_reordering", json!(on))
+    }
+    fn delay(mut self, distribution: &str, mean_ns: f64, std_ns: f64) -> Self {
+        self.delay = Some(json!({
+            "mean_ns": mean_ns, "std_ns": std_ns, "rv_distribution": distribution,
+            "activate_correlation": false, "half_life_period_ns": 0
+        }));
+        self
+    }
+    /// The limiter has no limit of its own: dpds-core derives it from the
+    /// buffer capacity (`derived_limit_bit`, capacity x 12304 bit).
+    fn limiter(mut self, mode: &str, rate_bps: f64) -> Self {
+        self.limiter = Some(json!({"mode": mode, "rate_bps": rate_bps}));
+        self
+    }
+    fn capacity(self, packets: usize) -> Self {
+        self.with("buffer_capacity", json!(packets))
+    }
+    fn build(&self) -> Config {
+        let mut v = json!({ "simulation_config": self.sim.clone() });
+        if let Some(d) = &self.delay {
+            v["delay_config"] = d.clone();
+        }
+        if let Some(l) = &self.limiter {
+            v["limiter_config"] = l.clone();
+        }
+        serde_json::from_value(v).expect("scenario config must parse")
+    }
+}
+
+fn trace(config: &Config, run: u32) -> (SimulationResults, Vec<Departure>) {
+    let mut departures = Vec::new();
+    let results = run_simulation_traced(config, run, |d| departures.push(*d));
+    (results, departures)
+}
+
+fn iat_ns(config: &Config) -> f64 {
+    let s = &config.simulation_config;
+    let rate_pps = s.rate_gbps * 1e9 / ((s.average_frame_size_byte + 20.) * 8.);
+    1e9 / rate_pps
+}
+
+fn expected_arrivals(config: &Config) -> u64 {
+    let duration_ns = (config.simulation_config.duration_s * 1e9).round();
+    (duration_ns / iat_ns(config)).floor() as u64 + 1
+}
+
+/// Tolerance for values read back from the 3-significant-digit histograms.
+fn hist_close(actual: f64, expected: f64) -> bool {
+    (actual - expected).abs() <= 0.0015 * expected.abs() + 1.0
+}
+
+fn sorted_by_seq(departures: &[Departure]) -> Vec<Departure> {
+    let mut v = departures.to_vec();
+    v.sort_by_key(|d| d.seq);
+    v
+}
+
+/// Oracle: aggregated results recomputed from the departure trace.
+fn check_aggregates(config: &Config, r: &SimulationResults, deps: &[Departure]) {
+    let n = deps.len();
+    assert!(n > 10, "scenario too small to be meaningful");
+
+    // delay = tx - rx
+    let delay_mean = deps
+        .iter()
+        .map(|d| d.tx_time_ns - d.rx_time_ns)
+        .sum::<f64>()
+        / n as f64;
+    assert!(
+        hist_close(r.delay_mean_ns, delay_mean),
+        "delay mean {} vs oracle {delay_mean}",
+        r.delay_mean_ns
+    );
+
+    // theoretical passage times
+    let delay_cfg = config.delay_config.as_ref().expect("delay config");
+    let mean = passage_time_reference_mean(delay_cfg.mean_ns, delay_cfg.std_ns, deps)
+        .expect("scenario has no passages");
+    assert!(hist_close(r.theoretical_passage_time_mean_ns, mean));
+}
+
+/// Reference for `theoretical_passage_time_mean_ns`: a standalone tracker fed
+/// with `send_time_ns - rx_time_ns` at time `rx_time_ns`, in arrival order.
+/// `None` if there is no passage.
+fn passage_time_reference_mean(mean_ns: f64, std_ns: f64, deps: &[Departure]) -> Option<f64> {
+    let mut tracker = PassageTimeTracker::new(mean_ns, std_ns);
+    let pts: Vec<f64> = sorted_by_seq(deps)
+        .iter()
+        .filter_map(|d| tracker.check_delay(d.send_time_ns as f64 - d.rx_time_ns, d.rx_time_ns))
+        .collect();
+    (!pts.is_empty()).then(|| pts.iter().sum::<f64>() / pts.len() as f64)
+}
+
+// -------------------------------------------------------------------- config
+
+#[test]
+fn new_optional_config_fields_default_to_none() {
+    let c = scenario().build();
+    let mut value = serde_json::to_value(&c).unwrap();
+    assert!(c.simulation_config.buffer_capacity.is_none());
+    assert!(c.simulation_config.loss_model.is_none());
+    assert_eq!(c.simulation_config.seed, Some(42)); // set by the fixture
+    let sim = value["simulation_config"].as_object_mut().unwrap();
+    sim.remove("seed");
+    let c: Config = serde_json::from_value(value).unwrap();
+    assert!(c.simulation_config.seed.is_none());
+}
+
+#[test]
+fn new_optional_config_fields_parse() {
+    let c = scenario()
+        .with("buffer_capacity", json!(5))
+        .with("loss_model", json!({"Random": 0.25}))
+        .with("seed", json!(9))
+        .build();
+    assert_eq!(c.simulation_config.buffer_capacity, Some(5));
+    assert_eq!(c.simulation_config.seed, Some(9));
+    assert!(matches!(
+        c.simulation_config.loss_model,
+        Some(dpds_core::dropper::LossModel::Random(p)) if p == 0.25
+    ));
+
+    let c = scenario()
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [0.1, 0.2, 0.9, 0.3, true]}),
+        )
+        .build();
+    assert!(matches!(
+        c.simulation_config.loss_model,
+        Some(dpds_core::dropper::LossModel::GilbertElliot(p, r, k, h, true))
+            if p == 0.1 && r == 0.2 && k == 0.9 && h == 0.3
+    ));
+}
+
+#[test]
+fn new_optional_config_fields_survive_a_serde_round_trip() {
+    let c = scenario()
+        .with("buffer_capacity", json!(7))
+        .with("loss_model", json!({"Random": 0.5}))
+        .build();
+    let back: Config = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+    assert_eq!(back.simulation_config.buffer_capacity, Some(7));
+    assert_eq!(back.simulation_config.seed, Some(42));
+    assert!(matches!(
+        back.simulation_config.loss_model,
+        Some(dpds_core::dropper::LossModel::Random(p)) if p == 0.5
+    ));
+}
+
+#[test]
+fn simulation_configs_json_still_parses_without_the_new_fields() {
+    let text = include_str!("../simulation_configs.json");
+    let configs: Vec<Config> = serde_json::from_str(text).unwrap();
+    assert!(configs.iter().all(|c| {
+        c.simulation_config.buffer_capacity.is_none()
+            && c.simulation_config.loss_model.is_none()
+            && c.simulation_config.seed.is_none()
+    }));
+}
+
+// ----------------------------------------------------------------------- csv
+
+const EXPECTED_HEADER: [&str; 8] = [
+    "run",
+    "delay_mean_ns",
+    "delay_std_ns",
+    "kendall_tau_distance_div_n",
+    "out_of_order_packets",
+    "theoretical_passage_time_mean_ns",
+    "dropped_packets_limiter",
+    "dropped_packets_buffer_full",
+];
+
+#[test]
+fn csv_header_is_exact() {
+    let header: Vec<&str> = CSV_HEADER.to_vec();
+    assert_eq!(header, EXPECTED_HEADER);
+}
+
+fn temp_csv(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("dpds-simulation-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{name}-{}.csv", std::process::id()))
+}
+
+/// Writes header + one row through the public CSV path and reads it back.
+fn csv_row_of(name: &str, results: &SimulationResults, run: u32) -> (Vec<String>, Vec<String>) {
+    let path = temp_csv(name);
+    let writer = Arc::new(Mutex::new(csv::Writer::from_writer(
+        File::create(&path).unwrap(),
+    )));
+    writer
+        .lock()
+        .unwrap()
+        .write_record(CSV_HEADER.iter().copied())
+        .unwrap();
+    results.write_to_csv(&writer, run).unwrap();
+    writer.lock().unwrap().flush().unwrap();
+    let (header, mut rows) = read_csv(&path);
+    assert_eq!(rows.len(), 1);
+    (header, rows.remove(0))
+}
+
+#[test]
+fn csv_row_has_one_field_per_header_column_in_header_order() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.005))
+        .with("loss_model", json!({"Random": 0.3}))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .capacity(200)
+        .reorder(true)
+        .build();
+    let r = run_simulation(&cfg, 0);
+    assert!(r.out_of_order_packets > 0, "scenario must reorder");
+    let (header, row) = csv_row_of("row-shape", &r, 3);
+    assert_eq!(row.len(), header.len());
+    let field =
+        |name: &str| -> &String { &row[header.iter().position(|h| h == name).expect(name)] };
+    assert_eq!(field("run"), "3");
+    assert_eq!(
+        field("out_of_order_packets"),
+        &r.out_of_order_packets.to_string()
+    );
+    assert_eq!(
+        field("delay_mean_ns").parse::<f64>().unwrap(),
+        r.delay_mean_ns
+    );
+    assert_eq!(
+        field("delay_std_ns").parse::<f64>().unwrap(),
+        r.delay_std_ns
+    );
+    assert_eq!(
+        field("dropped_packets_limiter"),
+        &r.dropped_packets_limiter.to_string()
+    );
+    assert_eq!(
+        field("dropped_packets_buffer_full"),
+        &r.dropped_packets_buffer_full.to_string()
+    );
+    assert_eq!(header.last().unwrap(), "dropped_packets_buffer_full");
+}
+
+#[test]
+fn binary_rows_equal_library_runs_with_seed_plus_run_index() {
+    let configs = r#"[{"simulation_config": {"duration_s": 0.0004, "runs": 3, "rate_gbps": 1.2,
+        "average_frame_size_byte": 1480, "activate_reordering": true,
+        "csv_output_path": "e2e.csv", "seed": 5, "loss_model": {"Random": 0.1}},
+      "delay_config": {"mean_ns": 100000, "std_ns": 30000,
+        "rv_distribution": "NormalDistribution", "activate_correlation": false,
+        "half_life_period_ns": 0}}]"#;
+    let parsed: Vec<Config> = serde_json::from_str(configs).unwrap();
+    let results_dir = run_sweep("model-e2e", configs, Some("2"));
+    let (_, rows) = read_csv(&results_dir.join("e2e.csv"));
+    assert_eq!(rows.len(), 3);
+    for run in 0..3u32 {
+        // looked up by run index: row ORDER is checked in sweep_driver.rs
+        let row = rows
+            .iter()
+            .find(|row| row[0] == run.to_string())
+            .unwrap_or_else(|| panic!("no row for run {run}"));
+        let r = run_simulation(&parsed[0], run);
+        let (_, expected) = csv_row_of(&format!("e2e-{run}"), &r, run);
+        assert_eq!(row, &expected, "run {run}");
+    }
+}
+
+// ---------------------------------------------------------- delay quantiles
+
+#[test]
+fn quantiles_of_a_constant_delay_all_equal_the_delay() {
+    let cfg = scenario()
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .build();
+    let q = run_simulation(&cfg, 0).delay_quantiles_ns;
+    assert_eq!(q.len(), QUANTILE_PROBABILITIES.len());
+    for (p, &v) in QUANTILE_PROBABILITIES.iter().zip(&q) {
+        assert!((v as f64 - 1e6).abs() <= 1e3, "p = {p}: {v}");
+    }
+}
+
+#[test]
+fn quantiles_of_a_normal_delay_follow_the_configured_distribution() {
+    // Reordering on: a packet leaves at its own send time, so the achieved
+    // delay is the configured one (FIFO would add head-of-line blocking).
+    let cfg = scenario()
+        .with("duration_s", json!(0.1))
+        .reorder(true)
+        .delay("NormalDistribution", 10_000_000., 1_000_000.)
+        .build();
+    let q = run_simulation(&cfg, 0).delay_quantiles_ns;
+    assert_eq!(q.len(), QUANTILE_PROBABILITIES.len());
+    assert!(q.windows(2).all(|w| w[0] <= w[1]), "not non-decreasing");
+    let at = |p: f64| -> f64 {
+        let i = QUANTILE_PROBABILITIES.iter().position(|&x| x == p).unwrap();
+        q[i] as f64
+    };
+    assert!((at(0.5) - 10e6).abs() <= 0.01 * 10e6, "median {}", at(0.5));
+    // 10001 packets: the standard error of these quantiles is about 0.02 std
+    assert!((at(0.16) - 9e6).abs() <= 0.1e6, "mean - std: {}", at(0.16));
+    assert!((at(0.84) - 11e6).abs() <= 0.1e6, "mean + std: {}", at(0.84));
+}
+
+// ------------------------------------------------- smoke over the real sweep
+
+#[test]
+fn smoke_run_of_a_sample_of_simulation_configs_departs_packets() {
+    let text = include_str!("../simulation_configs.json");
+    let configs: Vec<Config> = serde_json::from_str(text).unwrap();
+    let mut seen = HashSet::new();
+    for mut c in configs {
+        let key = format!(
+            "{:?}|{:?}|{:?}|{}|{:?}|{}",
+            c.delay_config.as_ref().map(|d| d.rv_distribution),
+            c.delay_config.as_ref().map(|d| d.activate_correlation),
+            c.limiter_config.as_ref().map(|l| l.mode),
+            c.simulation_config.activate_reordering,
+            c.simulation_config.reordering_metric,
+            c.simulation_config.rate_gbps,
+        );
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        c.simulation_config.duration_s = 0.0005;
+        c.simulation_config.runs = 1;
+        let (r, deps) = trace(&c, 0);
+        let arrivals = expected_arrivals(&c);
+        assert!(
+            !deps.is_empty() && deps.len() as u64 <= arrivals,
+            "{key}: {} departures vs {arrivals} arrivals",
+            deps.len()
+        );
+        assert!(r.delay_mean_ns.is_finite(), "{key}");
+    }
+    assert!(seen.len() >= 9, "sample too small: {}", seen.len());
+}
+
+// --------------------------------------------- deterministic delay, FIFO/heap
+
+fn constant_delay_departs_at_exact_send_times(reordering: bool) {
+    // 1_000_000.5 ns: dpds-core truncates the send time to whole ns.
+    let cfg = scenario()
+        .delay("DeterministicDistribution", 1_000_000.5, 0.)
+        .reorder(reordering)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 101, "arrivals at 0..=1_000_000 ns, inclusive");
+    for (k, d) in deps.iter().enumerate() {
+        assert_eq!(d.seq, k as u64);
+        assert_eq!(d.rx_time_ns, k as f64 * IAT);
+        assert_eq!(d.send_time_ns, 1_000_000 + 10_000 * k as u64, "truncated");
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64, "pop at the send time");
+    }
+    assert!(hist_close(r.delay_mean_ns, 1_000_000.));
+    assert!(r.delay_std_ns < 1.0, "every delay identical");
+    assert_eq!(r.out_of_order_packets, 0);
+}
+
+#[test]
+fn fifo_with_constant_delay_delays_every_packet_by_exactly_the_mean() {
+    constant_delay_departs_at_exact_send_times(false);
+}
+
+#[test]
+fn reordering_with_constant_delay_does_not_reorder() {
+    constant_delay_departs_at_exact_send_times(true);
+}
+
+#[test]
+fn constant_delay_with_sub_nanosecond_arrivals_keeps_sequence_order() {
+    // 1000 Gbit/s, 1 B frames: iat = 0.168 ns, many arrivals per whole ns of
+    // send time. Heap keys have 1/64 ns resolution (0.168 ns = ~10.75 units),
+    // so arrivals at different instants never tie and the order is preserved.
+    let cfg = scenario()
+        .with("rate_gbps", json!(1000.0))
+        .with("average_frame_size_byte", json!(1.0))
+        .with("duration_s", json!(2e-7))
+        .delay("DeterministicDistribution", 1000.0, 0.)
+        .reorder(true)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len() as u64, expected_arrivals(&cfg));
+    assert!(deps.len() > 1000);
+    for (k, d) in deps.iter().enumerate() {
+        assert_eq!(d.seq, k as u64);
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
+        if k > 0 {
+            assert!(d.send_time_ns >= deps[k - 1].send_time_ns);
+        }
+    }
+    assert_eq!(r.out_of_order_packets, 0);
+    assert!(deps[0].send_time_ns >= 1000);
+}
+
+#[test]
+fn default_buffer_capacity_does_not_bind() {
+    // ~1000 packets in flight (100 ms delay at 10 us spacing).
+    let cfg = scenario()
+        .with("duration_s", json!(0.01))
+        .delay("DeterministicDistribution", 100_000_000., 0.)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len() as u64, expected_arrivals(&cfg));
+}
+
+#[test]
+fn default_buffer_capacity_is_two_to_the_twenty_six() {
+    // M2: each run reserves 16 B x capacity up front; 2^26 = 1 GiB holds
+    // 8.3 s of 1518 B traffic at 100 Gbit/s, enough for the delay spikes of
+    // the correlated log-normal distribution that overflowed 2^21
+    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 1 << 26);
+    assert_eq!(lib::simulation::DEFAULT_BUFFER_CAPACITY, 67_108_864);
+}
+
+#[test]
+fn default_capacity_binds_exactly_at_two_to_the_twenty_six_packets_in_flight() {
+    // 100 Gbit/s, 64 B frames -> iat = 6.72 ns; every packet is held for 1 s
+    // (far beyond the 455 ms of arrivals), so nothing departs while arrivals
+    // last and the buffer holds exactly `capacity` packets, FIFO and heap.
+    for reordering in [false, true] {
+        let cfg = scenario()
+            .with("duration_s", json!(0.455)) // 67.7 M arrivals
+            .with("rate_gbps", json!(100.0))
+            .with("average_frame_size_byte", json!(64))
+            .delay("DeterministicDistribution", 1_000_000_000., 0.)
+            .reorder(reordering)
+            .build();
+        let arrivals = expected_arrivals(&cfg);
+        assert!(arrivals > (1 << 26) + 50_000, "{arrivals} arrivals");
+        let mut departures = 0u64;
+        run_simulation_traced(&cfg, 0, |_| departures += 1);
+        assert_eq!(departures, 1 << 26, "reordering={reordering}");
+    }
+}
+
+#[test]
+fn an_explicit_capacity_overrides_the_default() {
+    let cfg = scenario()
+        .with("buffer_capacity", json!(2))
+        .delay("DeterministicDistribution", 1_000_000_000., 0.)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 2);
+}
+
+// ------------------------------------------------- buffer-full drops counted
+
+/// Capacity 5, delay 1 ms (100 inter-arrival times), no loss, no limiter; 301
+/// arrivals, 5 accepted per 100 and the last one (index 300) too = 16:
+/// every arrival is either accepted (it departs) or rejected as buffer-full.
+#[test]
+fn buffer_full_drops_are_counted_and_reach_the_csv() {
+    for reordering in [false, true] {
+        let cfg = scenario()
+            .with("duration_s", json!(0.003))
+            .capacity(5)
+            .delay("DeterministicDistribution", 1_000_000., 0.)
+            .reorder(reordering)
+            .build();
+        let (r, deps) = trace(&cfg, 0);
+        let expected = expected_arrivals(&cfg) - deps.len() as u64;
+        assert_eq!(deps.len(), 16, "reordering={reordering}");
+        assert!(expected > 0, "scenario must overflow the buffer");
+        assert_eq!(
+            r.dropped_packets_buffer_full, expected,
+            "reordering={reordering}"
+        );
+        assert_eq!(r.dropped_packets_limiter, 0);
+        let (header, row) = csv_row_of("buffer-full", &r, 0);
+        let column = header
+            .iter()
+            .position(|h| h == "dropped_packets_buffer_full")
+            .expect("column");
+        assert_eq!(row[column], expected.to_string());
+    }
+}
+
+#[test]
+fn no_buffer_full_drops_with_a_large_buffer() {
+    let cfg = scenario()
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .build();
+    assert_eq!(run_simulation(&cfg, 0).dropped_packets_buffer_full, 0);
+}
+
+// ----------------------------------------------------- random delay: ordering
+
+#[test]
+fn fifo_with_random_delay_departs_in_sequence_order_with_head_of_line_blocking() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.005)) // 501 packets
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 501);
+    let mut previous_tx = f64::NEG_INFINITY;
+    let mut blocked = 0;
+    for (k, d) in deps.iter().enumerate() {
+        assert_eq!(d.seq, k as u64, "FIFO: departures in sequence order");
+        // measured delay >= theoretical (sampled) delay
+        assert!(d.tx_time_ns >= d.send_time_ns as f64);
+        assert!(d.tx_time_ns - d.rx_time_ns >= d.send_time_ns as f64 - d.rx_time_ns);
+        // a packet leaves at its send time or, if blocked, right after its predecessor
+        assert_eq!(
+            d.tx_time_ns,
+            previous_tx.max(d.send_time_ns as f64),
+            "seq {k}"
+        );
+        if d.tx_time_ns > d.send_time_ns as f64 {
+            blocked += 1;
+        }
+        previous_tx = d.tx_time_ns;
+    }
+    assert!(
+        blocked > 0,
+        "std 300 us >> iat 10 us must block heads of line"
+    );
+    assert_eq!(r.out_of_order_packets, 0);
+    check_aggregates(&cfg, &r, &deps);
+}
+
+#[test]
+fn reordering_with_random_delay_departs_in_send_time_order() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.005))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .reorder(true)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 501);
+    for (i, d) in deps.iter().enumerate() {
+        assert_eq!(
+            d.tx_time_ns, d.send_time_ns as f64,
+            "popped exactly when due"
+        );
+        if i > 0 {
+            assert!(
+                d.send_time_ns >= deps[i - 1].send_time_ns,
+                "sorted by send time"
+            );
+        }
+    }
+    let seqs: HashSet<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..501).collect::<HashSet<u64>>(),
+        "every packet once"
+    );
+
+    // out-of-order counter recomputed from the trace (same rule as statistics.rs)
+    let mut expected_next = 0u64;
+    let mut out_of_order = 0usize;
+    for d in &deps {
+        if d.seq < expected_next {
+            out_of_order += 1;
+        } else {
+            expected_next = d.seq + 1;
+        }
+    }
+    assert!(out_of_order > 0, "std 300 us >> iat 10 us must reorder");
+    assert_eq!(r.out_of_order_packets, out_of_order);
+    check_aggregates(&cfg, &r, &deps);
+}
+
+#[test]
+fn reordering_results_can_use_the_kendall_tau_metric() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.002)) // 201 packets
+        .with("reordering_metric", json!("kendall_tau_distance"))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .reorder(true)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    let mut inversions = 0usize;
+    for i in 0..deps.len() {
+        for j in (i + 1)..deps.len() {
+            if deps[i].seq > deps[j].seq {
+                inversions += 1;
+            }
+        }
+    }
+    assert!(inversions > 0);
+    assert_kendall_div_n(&r, inversions, deps.len());
+    assert_eq!(r.out_of_order_packets, 0);
+}
+
+// ------------------------------------------- Kendall tau with dropped packets
+
+/// `kendall_tau_distance_div_n` = inversions per departed packet.
+fn assert_kendall_div_n(r: &SimulationResults, inversions: usize, departed: usize) {
+    assert!(
+        (r.kendall_tau_distance_div_n - inversions as f64 / departed as f64).abs() < 1e-12,
+        "div_n {} vs {inversions}/{departed}",
+        r.kendall_tau_distance_div_n
+    );
+}
+
+/// Oracle: inversions among the packets that actually departed, from the
+/// departure trace (pairs transmitted in the opposite order of their arrival).
+fn survivor_inversions(deps: &[Departure]) -> usize {
+    let mut inversions = 0;
+    for i in 0..deps.len() {
+        for j in (i + 1)..deps.len() {
+            if deps[i].seq > deps[j].seq {
+                inversions += 1;
+            }
+        }
+    }
+    inversions
+}
+
+fn kendall(scenario: Scenario) -> Scenario {
+    scenario.with("reordering_metric", json!("kendall_tau_distance"))
+}
+
+/// H1: lost / limited / buffer-full packets must never count as inversions.
+fn assert_kendall_counts_only_survivors(cfg: &Config, expect_reordering: bool) {
+    let (r, deps) = trace(cfg, 0);
+    let arrivals = expected_arrivals(cfg);
+    assert!(
+        (deps.len() as u64) < arrivals
+            && deps.iter().map(|d| d.seq).max().unwrap() >= deps.len() as u64,
+        "arrival indices must keep their gaps (seq counts every arrival)"
+    );
+    let inversions = survivor_inversions(&deps);
+    if expect_reordering {
+        assert!(inversions > 0, "scenario must reorder survivors");
+    } else {
+        assert_eq!(inversions, 0);
+    }
+    assert_kendall_div_n(&r, inversions, deps.len());
+    assert_eq!(r.out_of_order_packets, 0, "the other metric stays unused");
+}
+
+#[test]
+fn kendall_tau_with_a_loss_model_equals_the_inversions_of_the_survivors() {
+    let cfg = kendall(
+        scenario()
+            .with("duration_s", json!(0.005)) // 501 arrivals
+            .with("loss_model", json!({"Random": 0.3}))
+            .delay("NormalDistribution", 1_000_000., 300_000.)
+            .reorder(true),
+    )
+    .build();
+    assert_kendall_counts_only_survivors(&cfg, true);
+}
+
+#[test]
+fn kendall_tau_with_gilbert_elliot_burst_loss_equals_the_survivor_inversions() {
+    let cfg = kendall(
+        scenario()
+            .with("duration_s", json!(0.005))
+            .with(
+                "loss_model",
+                json!({"GilbertElliot": [0.2, 0.3, 0.9, 0.0, true]}),
+            )
+            .delay("NormalDistribution", 1_000_000., 300_000.)
+            .reorder(true),
+    )
+    .build();
+    assert_kendall_counts_only_survivors(&cfg, true);
+}
+
+#[test]
+fn kendall_tau_with_a_tiny_capacity_equals_the_inversions_of_the_survivors() {
+    // 10 slots, ~100 packets in flight (1 ms delay, 10 us iat): most arrivals
+    // hit a full buffer.
+    let cfg = kendall(
+        scenario()
+            .with("duration_s", json!(0.005))
+            .with("buffer_capacity", json!(10))
+            .delay("NormalDistribution", 1_000_000., 300_000.)
+            .reorder(true),
+    )
+    .build();
+    assert_kendall_counts_only_survivors(&cfg, true);
+}
+
+#[test]
+fn kendall_tau_with_reordering_and_a_spacer_equals_the_inversions_of_the_survivors() {
+    // The Spacer sits behind the reorder heap and keeps the heap order, so the
+    // jitter-induced inversions survive it; loss and a small capacity drop
+    // packets on top.
+    let cfg = kendall(
+        scenario()
+            .with("duration_s", json!(0.005))
+            .with("loss_model", json!({"Random": 0.3}))
+            .capacity(100)
+            .delay("NormalDistribution", 300_000., 150_000.)
+            .limiter("Spacer", 0.5e9)
+            .reorder(true),
+    )
+    .build();
+    assert_kendall_counts_only_survivors(&cfg, true);
+}
+
+#[test]
+fn kendall_tau_without_reordering_is_zero_even_when_packets_are_dropped() {
+    // FIFO keeps the order of the survivors: whatever is dropped, 0 inversions.
+    for loss in [0.1, 0.5, 0.9] {
+        let cfg = kendall(
+            scenario()
+                .with("duration_s", json!(0.005))
+                .with("loss_model", json!({"Random": loss}))
+                .delay("NormalDistribution", 1_000_000., 300_000.),
+        )
+        .build();
+        let (r, deps) = trace(&cfg, 0);
+        assert!(
+            (deps.len() as u64) < expected_arrivals(&cfg),
+            "loss {loss}: packets must be dropped"
+        );
+        assert!(
+            deps.windows(2).all(|w| w[0].seq < w[1].seq),
+            "FIFO order of the survivors"
+        );
+        assert_eq!(r.kendall_tau_distance_div_n, 0.0, "loss {loss}");
+    }
+}
+
+#[test]
+fn kendall_tau_without_survivors_is_zero() {
+    let cfg = kendall(
+        scenario()
+            .with("loss_model", json!({"Random": 1.0}))
+            .delay("NormalDistribution", 1_000_000., 300_000.)
+            .reorder(true),
+    )
+    .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert!(deps.is_empty());
+    assert_eq!(r.kendall_tau_distance_div_n, 0.0);
+}
+
+#[test]
+fn kendall_tau_is_independent_of_which_packets_were_dropped() {
+    // Same survivors' relative order => same distance, however sparse the
+    // arrival indices are: compare the result with the oracle for several
+    // seeds (different loss patterns).
+    for seed in [1u64, 2, 3, 4, 5] {
+        let cfg = kendall(
+            scenario()
+                .with("duration_s", json!(0.003))
+                .with("seed", json!(seed))
+                .with("loss_model", json!({"Random": 0.4}))
+                .delay("NormalDistribution", 600_000., 250_000.)
+                .reorder(true),
+        )
+        .build();
+        let (r, deps) = trace(&cfg, 0);
+        assert_kendall_div_n(&r, survivor_inversions(&deps), deps.len());
+    }
+}
+
+#[test]
+fn out_of_order_counter_with_drops_still_matches_the_trace() {
+    // The default metric ignores gaps already; the dense ordinal must not
+    // change it.
+    let cfg = scenario()
+        .with("duration_s", json!(0.005))
+        .with("loss_model", json!({"Random": 0.3}))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .reorder(true)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    let mut expected_next = 0u64;
+    let mut out_of_order = 0usize;
+    for d in &deps {
+        if d.seq < expected_next {
+            out_of_order += 1;
+        } else {
+            expected_next = d.seq + 1;
+        }
+    }
+    assert!(out_of_order > 0);
+    assert_eq!(r.out_of_order_packets, out_of_order);
+    assert_eq!(r.kendall_tau_distance_div_n, 0.0);
+}
+
+// ------------------------------------------------------------------ limiters
+
+/// Service time of one packet at 0.5 bit/ns.
+const SERVICE_NS: u64 = 24_000;
+
+/// `dpds_core::derived_limit_bit(capacity)` = capacity * 1538 * 8 = 12304 *
+/// capacity bit (1518 B frame incl. FCS + 20 L1, as the limiter counts a
+/// maximum-size packet).
+#[test]
+fn derived_limit_is_capacity_times_the_maximum_wire_frame() {
+    assert_eq!(dpds_core::MAX_FRAME_WIRE_BYTES, 1538);
+    assert_eq!(dpds_core::derived_limit_bit(1), 12_304.0);
+    assert_eq!(dpds_core::derived_limit_bit(110), 1_353_440.0);
+    assert_eq!(
+        dpds_core::derived_limit_bit(2_097_152),
+        2_097_152.0 * 12_304.0
+    );
+}
+
+/// Spacer at 0.5 bit/ns (0.5 Gbit/s), one packet = 12000 bit -> 24000 ns of
+/// service, but one arrival per 10000 ns: a queue builds. With a delay of
+/// 300 us and a capacity of 20 packets (limit 246080 bit, about 20.5 packets)
+/// the buffer is the bottleneck: the queue the Spacer builds stays far below
+/// its limit while the 300 us delay keeps the buffer full, so arrivals are
+/// rejected as buffer-full. A buffer-full packet touches no limiter state,
+/// so the accepted packets keep EXACT spacing: every departure is
+/// 24000 ns after the previous one, the j-th is at 300000 + 24000 j (checked
+/// with an independent re-implementation of buffer.rs/limiter.rs; before the
+/// capacity check moved first, rejected packets advanced the Spacer and left
+/// gaps of 48000 ns and more).
+#[test]
+fn buffer_full_packets_do_not_advance_the_spacer() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.003))
+        .capacity(20)
+        .delay("DeterministicDistribution", 300_000., 0.)
+        .limiter("Spacer", 0.5e9)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(expected_arrivals(&cfg), 301);
+    assert_eq!(deps.len(), 133);
+    for (j, d) in deps.iter().enumerate() {
+        assert_eq!(
+            d.send_time_ns,
+            300_000 + SERVICE_NS * j as u64,
+            "departure {j} (arrival {})",
+            d.seq
+        );
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
+    }
+    // the gaps in the arrival sequence prove that buffer-full drops happened
+    // in between: the first 20 packets are accepted back to back, then the
+    // buffer is full until the first one leaves at 300 us
+    let first_21: Vec<u64> = deps.iter().take(21).map(|d| d.seq).collect();
+    assert_eq!(
+        first_21,
+        (0..20).chain([30]).collect::<Vec<u64>>(),
+        "first accepted arrivals"
+    );
+}
+
+/// Delay 1 ms and capacity 13: arrivals 0..12 fill the buffer and are
+/// spaced by the Spacer (send = 1e6 + 24000 k); 13..99 are rejected as
+/// buffer-full. When packet 0 leaves at 1 ms, arrival 100 (t = 1 ms, tie rule:
+/// transmit first) is accepted and finds an EMPTY Spacer: it leaves at exactly
+/// its own time-to-send, 2 ms. Had the 87 rejected packets been accounted, it
+/// would be queued behind their phantom backlog.
+#[test]
+fn first_packet_after_a_buffer_full_phase_finds_an_idle_spacer() {
+    let cfg = scenario()
+        .capacity(13)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .limiter("Spacer", 0.5e9)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    let first_14: Vec<(u64, u64)> = deps
+        .iter()
+        .take(14)
+        .map(|d| (d.seq, d.send_time_ns))
+        .collect();
+    assert_eq!(
+        first_14,
+        vec![
+            (0, 1_000_000),
+            (1, 1_024_000),
+            (2, 1_048_000),
+            (3, 1_072_000),
+            (4, 1_096_000),
+            (5, 1_120_000),
+            (6, 1_144_000),
+            (7, 1_168_000),
+            (8, 1_192_000),
+            (9, 1_216_000),
+            (10, 1_240_000),
+            (11, 1_264_000),
+            (12, 1_288_000),
+            (100, 2_000_000),
+        ]
+    );
+    assert_eq!(deps.len(), 14);
+}
+
+/// Boundary of the derived limit of the SPACER. Rate 1000 bit/s (drains
+/// 0.01 bit per arrival, negligible), zero delay, 201 arrivals, capacity 110:
+/// limit = 110 * 12304 = 1353440 bit = 112.79 packets of 12000 bit, so the
+/// limiter lets exactly the first 112 pushes pass (112 * 12000 = 1344000 <=
+/// 1353440 < 113 * 12000) and rejects every later one. The Gilbert-Elliot
+/// model with p = r = 1, k = 1, h = 0 loses every second packet, starting with
+/// the second (the loss model is consulted for every pushed packet, also after
+/// the limiter has rejected it), and a lost packet takes precedence over a
+/// limiter rejection. Pushes 0..=111 pass the limiter: 56 survive (even
+/// indices). Pushes 112..=200: the odd ones (44) are Lost, the even ones (45)
+/// are LimiterDrop. A slot of 12336 bit (limit 1356960) would let push 112
+/// pass too (57 survive), one of 12000 bit only pushes 0..=109 (55 survive).
+#[test]
+fn spacer_limit_is_the_derived_capacity_times_12304_bit() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.002))
+        .capacity(110)
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [1.0, 1.0, 1.0, 0.0, true]}),
+        )
+        .limiter("Spacer", 1e3)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(expected_arrivals(&cfg), 201);
+    assert_eq!(deps.len(), 56);
+    assert_eq!(
+        r.dropped_packets_limiter, 45,
+        "lost packets are not counted"
+    );
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, (0..=110).step_by(2).collect::<Vec<u64>>());
+}
+
+#[test]
+fn spacer_below_offered_load_without_limit_pressure_departs_every_service_time() {
+    let cfg = scenario()
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .limiter("Spacer", 0.5e9)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 101);
+    for (k, d) in deps.iter().enumerate() {
+        assert_eq!(d.send_time_ns, 1_000_000 + SERVICE_NS * k as u64);
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
+    }
+}
+
+#[test]
+fn spacer_above_offered_load_neither_delays_nor_drops() {
+    // 2 bit/ns: service 6016 ns < iat 10000 ns, the fill state is always empty.
+    let cfg = scenario().limiter("Spacer", 2e9).build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 101);
+    for d in &deps {
+        assert_eq!(d.tx_time_ns, d.rx_time_ns, "no delay config: zero delay");
+    }
+}
+
+/// `average_frame_size_byte` includes the 4-B FCS, so a 1518-B frame occupies
+/// (1518 + 20) * 8 = 12304 bit on the wire, both for the arrival process and
+/// for the Spacer. Spacer at offered rate / 0.999 (utilization 0.999): it drains
+/// more than one frame per inter-arrival time, so no queue ever builds and
+/// every packet leaves at its arrival. Counting the FCS twice (1542 B) would
+/// give utilization 0.999 * 1542 / 1538 > 1 and a delay growing by ~1.6 ns per
+/// packet (~1.6 us after 1001 packets).
+#[test]
+fn spacer_just_above_the_offered_load_never_delays_full_size_frames() {
+    let rate_gbps = 12.304; // 12304 bit per frame -> iat 1000 ns
+    let cfg = scenario()
+        .with("average_frame_size_byte", json!(1518))
+        .with("rate_gbps", json!(rate_gbps))
+        .limiter("Spacer", rate_gbps * 1e9 / 0.999)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 1001);
+    assert_eq!(r.dropped_packets_limiter, 0);
+    let max_delay_ns = deps
+        .iter()
+        .map(|d| d.tx_time_ns - d.rx_time_ns)
+        .fold(0., f64::max);
+    assert!(
+        max_delay_ns < 1.0,
+        "Spacer at utilization 0.999 queued packets: max delay {max_delay_ns} ns"
+    );
+}
+
+#[test]
+fn frame_size_is_rounded_up_to_whole_bytes_for_the_limiter() {
+    // 1479.2 B -> 1480 B -> 12000 bit -> 24000 ns spacing (floor/round would
+    // give 23984). The backlog exists from the second packet on; allow 1 ns
+    // for float noise because the arrival spacing is not an integer here.
+    let cfg = scenario()
+        .with("average_frame_size_byte", json!(1479.2))
+        .limiter("Spacer", 0.5e9)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert!(deps.len() > 20);
+    for pair in deps.windows(2).skip(5) {
+        let gap = pair[1].tx_time_ns - pair[0].tx_time_ns;
+        assert!((23_999.0..=24_001.0).contains(&gap), "gap {gap}");
+    }
+}
+
+/// TBF at 0.5 bit/ns with capacity 3: the bucket is the derived 3 * 12304 =
+/// 36912 bit (starts full), gains 5000 bit per arrival and a packet costs
+/// 12000 bit. Zero delay, so the buffer never holds anything. Hand derivation
+/// (checked with an independent re-implementation of limiter.rs): accept
+/// 0,1,2,3 (36912 -> 24912, 17912, 10912, 3912 after), drop 4 (8912 < 12000),
+/// accept 5, then 8, 10, 12, 15, 17, 20, 22, ... (a 37008-bit bucket would
+/// accept 7 and 19 instead of 8 and 20). Out-of-budget packets are
+/// dropped (not delayed) and accepted ones are not delayed either.
+#[test]
+fn token_bucket_filter_admits_bursts_then_drops_out_of_budget_packets() {
+    let cfg = scenario()
+        .capacity(3)
+        .limiter("TokenBucketFilter", 0.5e9)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(&seqs[..12], &[0, 1, 2, 3, 5, 8, 10, 12, 15, 17, 20, 22]);
+    assert_eq!(deps.len(), 44);
+    assert_eq!(r.dropped_packets_limiter, 57);
+    for d in &deps {
+        assert_eq!(d.tx_time_ns, d.rx_time_ns, "TBF admits without delay");
+    }
+}
+
+/// Boundary of the derived limit of the TOKEN BUCKET FILTER: the bucket
+/// starts full with `capacity * 12304` bit and, at 1000 bit/s (0.01 bit
+/// gained per arrival), is not refilled to speak of, so the number of
+/// admitted packets is `floor(capacity * 12304 / 12000)`: 1 for capacity 1,
+/// 2 for 2 and 39 for 39 (479856 bit < 40 * 12000 = 480000), but 41 for 40
+/// (492160 >= 41 * 12000 = 492000). A depth of `capacity * 12000` bit would
+/// admit 40 for capacity 40, one of `capacity * 12336` bit 40 for 39.
+#[test]
+fn token_bucket_depth_is_the_derived_capacity_times_12304_bit() {
+    for (capacity, admitted) in [(1usize, 1usize), (2, 2), (39, 39), (40, 41), (41, 42)] {
+        let cfg = scenario()
+            .capacity(capacity)
+            .limiter("TokenBucketFilter", 1e3)
+            .build();
+        let (r, deps) = trace(&cfg, 0);
+        assert_eq!(deps.len(), admitted, "capacity {capacity}");
+        let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+        assert_eq!(seqs, (0..admitted as u64).collect::<Vec<_>>());
+        assert_eq!(
+            r.dropped_packets_limiter,
+            101 - admitted as u64,
+            "capacity {capacity}"
+        );
+    }
+}
+
+/// Capacity 3, TBF at 0.5 bit/ns, delay 1 ms (100 inter-arrival times).
+/// Arrivals 0,1,2 are accepted (bucket 36912 -> 912 bit) and fill the
+/// buffer; 3..99 are rejected as buffer-full and must NOT consume tokens: at
+/// arrival 100 (tie rule: packet 0 leaves first) the bucket has refilled
+/// completely, so 100, 101, 102 are accepted again, and so on. The cycle
+/// repeats every 100 arrivals: accepted = k with k % 100 < 3. No arrival is
+/// ever limiter-dropped. (With the old order, 3 consumed tokens and 4.. were
+/// limiter drops.)
+#[test]
+fn buffer_full_packets_do_not_consume_token_bucket_tokens() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.0035))
+        .capacity(3)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .limiter("TokenBucketFilter", 0.5e9)
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert_eq!(expected_arrivals(&cfg), 351);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 100, 101, 102, 200, 201, 202, 300, 301, 302]
+    );
+    assert_eq!(r.dropped_packets_limiter, 0);
+    assert_eq!(r.dropped_packets_buffer_full, 351 - 12);
+}
+
+// ---------------------------------------------------------- capacity and ties
+
+/// Delay exactly one inter-arrival time and capacity 1: packet k leaves at the
+/// very instant packet k+1 arrives. TIE RULE: the transmit event goes first,
+/// so the slot is free and nothing is dropped. (Arrival-first would drop every
+/// second packet: 50 drops.)
+fn equal_time_transmit_before_arrival(reordering: bool) {
+    let cfg = scenario()
+        .with("buffer_capacity", json!(1))
+        .delay("DeterministicDistribution", IAT, 0.)
+        .reorder(reordering)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 101, "transmit must precede arrival: no drops");
+    for (k, d) in deps.iter().enumerate() {
+        assert_eq!(d.seq, k as u64);
+        assert_eq!(d.send_time_ns, 10_000 * (k as u64 + 1));
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64);
+    }
+}
+
+#[test]
+fn equal_time_transmit_is_processed_before_arrival_in_fifo_mode() {
+    equal_time_transmit_before_arrival(false);
+}
+
+#[test]
+fn equal_time_transmit_is_processed_before_arrival_in_reordering_mode() {
+    equal_time_transmit_before_arrival(true);
+}
+
+/// Capacity 3, delay 100000.5 ns (-> 100000 ns, ten inter-arrival times): the
+/// buffer fills with packets 0,1,2; at arrival 10 (t = 1e5) packet 0 leaves
+/// first (tie rule) and 10 is accepted, 11 and 12 likewise, then 13..19 find the
+/// buffer full, and so on: accepted = k with k % 10 < 3, i.e. 31 of 101.
+fn capacity_causes_buffer_full_drops(reordering: bool) {
+    let cfg = scenario()
+        .with("buffer_capacity", json!(3))
+        .delay("DeterministicDistribution", 100_000.5, 0.)
+        .reorder(reordering)
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    let expected: Vec<u64> = (0..=100).filter(|k| k % 10 < 3).collect();
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, expected);
+    assert_eq!(deps.len(), 31);
+}
+
+#[test]
+fn capacity_drops_arrivals_in_fifo_mode() {
+    capacity_causes_buffer_full_drops(false);
+}
+
+#[test]
+fn capacity_drops_arrivals_in_reordering_mode() {
+    capacity_causes_buffer_full_drops(true);
+}
+
+#[test]
+fn zero_capacity_rejects_every_packet_as_buffer_full() {
+    let cfg = scenario().with("buffer_capacity", json!(0)).build();
+    let (_, deps) = trace(&cfg, 0);
+    assert!(deps.is_empty());
+}
+
+// ----------------------------------------------------------------------- loss
+
+#[test]
+fn random_loss_one_loses_every_packet() {
+    let cfg = scenario()
+        .with("loss_model", json!({"Random": 1.0}))
+        .build();
+    let (r, deps) = trace(&cfg, 0);
+    assert!(deps.is_empty());
+    assert!(r.delay_mean_ns.is_finite() && r.theoretical_passage_time_mean_ns.is_finite());
+}
+
+#[test]
+fn random_loss_zero_and_default_lose_nothing() {
+    for cfg in [
+        scenario().build(),
+        scenario()
+            .with("loss_model", json!({"Random": 0.0}))
+            .build(),
+    ] {
+        let (_, deps) = trace(&cfg, 0);
+        assert_eq!(deps.len(), 101);
+    }
+}
+
+#[test]
+fn random_loss_probability_is_respected_statistically() {
+    // 20001 arrivals, p = 0.3: expected 6000.3 lost, sigma = 65; +-400 = 6 sigma.
+    let cfg = scenario()
+        .with("duration_s", json!(0.2))
+        .with("loss_model", json!({"Random": 0.3}))
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    let arrivals = expected_arrivals(&cfg);
+    assert_eq!(arrivals, 20_001);
+    let lost = arrivals - deps.len() as u64;
+    assert!(lost.abs_diff(6_000) <= 400, "lost {lost}");
+    for pair in deps.windows(2) {
+        assert!(pair[0].seq < pair[1].seq, "FIFO order with gaps");
+    }
+}
+
+#[test]
+fn gilbert_elliot_loss_model_is_applied() {
+    // good -> bad with probability 1, never back; k = 1 (good never loses),
+    // h = 0 (bad always loses): first packet survives, all others are lost.
+    let cfg = scenario()
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [1.0, 0.0, 1.0, 0.0, true]}),
+        )
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].seq, 0);
+}
+
+/// Capacity 1, delay 1 ms, Gilbert-Elliot with p = r = 1, k = 1, h = 0 (every
+/// second loss draw is lost, starting with the second). Arrival 0 draws first
+/// (survives) and fills the buffer; 1..99 are rejected as buffer-full and must
+/// not consume a loss draw; at arrival 100 (packet 0 leaves first, tie rule)
+/// the model is at its second draw and loses it, arrival 101 draws a survivor
+/// and is accepted. Departures: 0 and 101. (Were the draw consumed by every
+/// arrival, arrival 100 would be an even draw and survive: 0 and 100.)
+#[test]
+fn buffer_full_packets_consume_no_loss_draw() {
+    let cfg = scenario()
+        .with("duration_s", json!(0.0012))
+        .capacity(1)
+        .delay("DeterministicDistribution", 1_000_000., 0.)
+        .with(
+            "loss_model",
+            json!({"GilbertElliot": [1.0, 1.0, 1.0, 0.0, true]}),
+        )
+        .build();
+    let (_, deps) = trace(&cfg, 0);
+    let seqs: Vec<u64> = deps.iter().map(|d| d.seq).collect();
+    assert_eq!(seqs, vec![0, 101]);
+}
+
+// ----------------------------------------------- reordering with a Spacer
+
+/// Reordering (heap) + active Spacer: 501 packets, delay 1 ms +- 300 us
+/// (heavy reordering), Spacer at 0.5 Gbit/s (24000 ns per packet against 10000
+/// ns inter-arrival time, so a backlog builds and spacing is substantial).
+fn spaced_reordering(spacer: bool) -> Config {
+    let s = scenario()
+        .with("duration_s", json!(0.005))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+        .reorder(true);
+    if spacer {
+        s.limiter("Spacer", 0.5e9).build()
+    } else {
+        s.build()
+    }
+}
+
+#[test]
+fn reordering_with_a_spacer_pops_exactly_when_packets_really_leave() {
+    let (r, deps) = trace(&spaced_reordering(true), 0);
+    assert_eq!(
+        deps.len(),
+        501,
+        "the Spacer has no limit: nothing is dropped"
+    );
+    for d in &deps {
+        // spacing never delays an arrival
+        assert_eq!(d.rx_time_ns, d.seq as f64 * IAT, "seq {}", d.seq);
+        assert_eq!(d.tx_time_ns, d.send_time_ns as f64, "seq {}", d.seq);
+    }
+    assert!(
+        deps.windows(2).all(|w| w[0].tx_time_ns <= w[1].tx_time_ns),
+        "tx times never go back"
+    );
+    assert!(
+        r.out_of_order_packets > 0,
+        "std 300 us >> iat 10 us must reorder"
+    );
+    assert_eq!(r.dropped_packets_limiter, 0, "the Spacer has no limit");
+}
+
+#[test]
+fn reordering_with_a_spacer_spaces_the_reordered_departures_of_the_same_run_without_it() {
+    let (_, reordered) = trace(&spaced_reordering(false), 0);
+    let (_, spaced) = trace(&spaced_reordering(true), 0);
+    assert_eq!(reordered.len(), 501);
+
+    // Reference: the heap times (= send times without a limiter) in departure
+    // order through a standalone Spacer. The frame size includes the FCS, so
+    // the Spacer gets it unchanged (the buffer adds back the 4 B the
+    // simulation removed).
+    let frame = scenario()
+        .build()
+        .simulation_config
+        .average_frame_size_byte
+        .ceil() as u32;
+    let mut spacer = Limiter::new(LimiterMode::Spacer, true, 0.5e9, f64::MAX);
+    let expected: Vec<f64> = reordered
+        .iter()
+        .map(|d| {
+            let heap_time_ns = d.send_time_ns as f64;
+            let offset_ns = spacer
+                .limiter_calculate_offset_ns(heap_time_ns, frame)
+                .expect("limit f64::MAX never drops");
+            (heap_time_ns + offset_ns) as u64 as f64
+        })
+        .collect();
+    let tx: Vec<f64> = spaced.iter().map(|d| d.tx_time_ns).collect();
+    assert_eq!(tx, expected);
+    assert!(
+        reordered
+            .iter()
+            .zip(&expected)
+            .any(|(d, e)| d.tx_time_ns != *e),
+        "the Spacer must actually space something"
+    );
+
+    let packets = |deps: &[Departure]| -> HashSet<(u64, u64)> {
+        deps.iter()
+            .map(|d| (d.seq, d.rx_time_ns.to_bits()))
+            .collect()
+    };
+    assert_eq!(packets(&spaced), packets(&reordered));
+}
+
+/// Delay config of the passage-time tests: mean 1 ms +- 300 us (thresholds
+/// 700 us / 1.3 ms), optionally with the correlated delayer.
+fn passage_scenario(correlated: bool) -> Scenario {
+    let mut s = scenario()
+        .with("duration_s", json!(0.02)) // 2001 packets
+        .delay("NormalDistribution", 1_000_000., 300_000.);
+    if correlated {
+        let delay = s.delay.as_mut().unwrap();
+        delay["activate_correlation"] = json!(true);
+        delay["half_life_period_ns"] = json!(200_000.);
+    }
+    s
+}
+
+/// FIFO: the send time at pop equals the send time reported at push, so the
+/// passage times are those of the `send_time - rx` series in arrival order,
+/// with and without the correlated delayer and Spacer. (A Spacer on
+/// uncorrelated delays makes the send times monotone: no passages at all.)
+#[test]
+fn fifo_passage_time_is_that_of_the_send_times_in_arrival_order() {
+    for (correlated, spacer) in [(false, false), (true, false), (true, true)] {
+        let s = passage_scenario(correlated).with("loss_model", json!({"Random": 0.1}));
+        let cfg = if spacer {
+            s.limiter("Spacer", 10e9).build()
+        } else {
+            s.build()
+        };
+        let (r, deps) = trace(&cfg, 0);
+        let d = cfg.delay_config.as_ref().unwrap();
+        let expected = passage_time_reference_mean(d.mean_ns, d.std_ns, &deps)
+            .unwrap_or_else(|| panic!("no passages (correlated={correlated} spacer={spacer})"));
+        assert!(
+            hist_close(r.theoretical_passage_time_mean_ns, expected),
+            "correlated={correlated} spacer={spacer}: {} vs {expected}",
+            r.theoretical_passage_time_mean_ns
+        );
+    }
+}
+
+/// Reordering + Spacer: the tracker gets the spaced send time at pop, not the
+/// heap time of the push. Spacer at 1.5 Gbit/s (8021 ns per packet against an
+/// inter-arrival time of 10000 ns): only the bunched heap times are spaced.
+#[test]
+fn reordering_with_a_spacer_passage_time_uses_the_spaced_send_times() {
+    let build = |spacer: bool| {
+        let s = passage_scenario(false).reorder(true);
+        if spacer {
+            s.limiter("Spacer", 1.5e9).build()
+        } else {
+            s.build()
+        }
+    };
+    let (r, spaced) = trace(&build(true), 0);
+    let (_, heap) = trace(&build(false), 0);
+    let delay = build(true).delay_config.unwrap();
+    let from_spaced = passage_time_reference_mean(delay.mean_ns, delay.std_ns, &spaced)
+        .expect("passages with spacing");
+    let from_heap = passage_time_reference_mean(delay.mean_ns, delay.std_ns, &heap)
+        .expect("passages at heap times");
+
+    assert!(
+        !hist_close(from_spaced, from_heap),
+        "spacing must move the passage time: spaced {from_spaced}, heap {from_heap}"
+    );
+    assert!(
+        hist_close(r.theoretical_passage_time_mean_ns, from_spaced),
+        "{} vs spaced reference {from_spaced} (heap-time version: {from_heap})",
+        r.theoretical_passage_time_mean_ns
+    );
+}
+
+// ----------------------------------------------------------------------- seed
+
+fn noisy() -> Scenario {
+    scenario()
+        .with("duration_s", json!(0.002))
+        .with("loss_model", json!({"Random": 0.1}))
+        .delay("NormalDistribution", 1_000_000., 300_000.)
+}
+
+#[test]
+fn same_seed_gives_identical_results_and_trace() {
+    for reordering in [false, true] {
+        let cfg = noisy().reorder(reordering).build();
+        let (r1, d1) = trace(&cfg, 0);
+        let (r2, d2) = trace(&cfg, 0);
+        assert_eq!(d1, d2);
+        assert_eq!(format!("{r1:?}"), format!("{r2:?}"));
+        let (_, row1) = csv_row_of("seed-same-1", &r1, 0);
+        let (_, row2) = csv_row_of("seed-same-2", &r2, 0);
+        assert_eq!(row1, row2);
+    }
+}
+
+#[test]
+fn different_seeds_give_different_results() {
+    let (_, d1) = trace(&noisy().with("seed", json!(1)).build(), 0);
+    let (_, d2) = trace(&noisy().with("seed", json!(2)).build(), 0);
+    assert_ne!(d1, d2);
+}
+
+#[test]
+fn run_r_with_seed_s_equals_run_zero_with_seed_s_plus_r() {
+    let base = noisy().with("seed", json!(1000));
+    let (_, run0) = trace(&base.build(), 0);
+    let (_, run3) = trace(&base.build(), 3);
+    let (_, shifted) = trace(&base.clone().with("seed", json!(1003)).build(), 0);
+    assert_eq!(run3, shifted);
+    assert_ne!(run0, run3);
+}
+
+#[test]
+fn unseeded_runs_complete() {
+    let mut cfg = noisy().build();
+    cfg.simulation_config.seed = None;
+    let (_, deps) = trace(&cfg, 0);
+    assert!(!deps.is_empty() && deps.len() as u64 <= expected_arrivals(&cfg));
+}
