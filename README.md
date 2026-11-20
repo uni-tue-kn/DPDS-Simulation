@@ -7,7 +7,7 @@ model**, then measures the statistics that characterise the emulated link: one-w
 delay jitter, packet reordering, delay *passage times* and limiter drops.
 
 It is the simulation companion to the
-[`dpds-core`](https://github.com/uni-tue-kn/DPDS/tree/nightly/crates/dpds-core) crate
+[`dpds-core`](https://github.com/uni-tue-kn/DPDS/tree/main/crates/dpds-core) crate
 (part of [DPDS](https://github.com/uni-tue-kn/DPDS)), which provides the underlying
 delayer and limiter models. The simulation sweeps a large grid of link
 configurations, writes per-run results to CSV, and ships R scripts that turn
@@ -276,11 +276,11 @@ See `results/Makefile` for individual targets.
 
 This crate depends on the `dpds-core` crate of the
 [DPDS](https://github.com/uni-tue-kn/DPDS) repository, fetched as a git
-dependency on its `nightly` branch (Cargo finds the package inside the DPDS
+dependency on its `main` branch (Cargo finds the package inside the DPDS
 workspace by name):
 
 ```toml
-dpds-core = { git = "https://github.com/uni-tue-kn/DPDS", branch = "nightly" }
+dpds-core = { git = "https://github.com/uni-tue-kn/DPDS", branch = "main" }
 ```
 
 The committed `Cargo.lock` pins the exact revision used, so builds are

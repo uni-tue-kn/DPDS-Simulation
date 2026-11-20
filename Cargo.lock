@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "dpds-core"
 version = "1.0.0"
-source = "git+https://github.com/uni-tue-kn/DPDS?branch=nightly#4136f6ce9a7605aab1888761974f8655e1ac496c"
+source = "git+https://github.com/uni-tue-kn/DPDS?branch=main#b9838a4ff7512673083b7f96ec5af56d834cc7aa"
 dependencies = [
  "rand",
  "rand_distr",
