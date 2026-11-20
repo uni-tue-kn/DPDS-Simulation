@@ -396,16 +396,20 @@ fn small_text() -> String {
     to_text(&small_values())
 }
 
-/// Wall-clock seconds one simulated second of the heavy config (reordering
-/// plus spacer, the costliest of the fixtures) costs in this build (debug or
-/// release), measured in-process with the same library the binary uses. Jobs
-/// whose duration matters are sized with it, so they take about the same time
-/// in every profile.
+/// Seconds one simulated second of the heavy config (reordering plus spacer,
+/// the costliest of the fixtures) costs in this build (debug or release),
+/// measured in-process with the same library the binary uses. Jobs whose
+/// duration matters are sized with it, so they take about the same time in
+/// every profile.
 ///
 /// Measured once per test process, over windows of at least 200 ms, and the
-/// fastest of five samples (spaced out in time) counts: other tests run in
-/// parallel and a load spike only ever makes a sample slower, so the minimum
-/// can overestimate the cost only if the machine is loaded during all of them.
+/// fastest of five samples (spaced out in time) counts. The samples count the
+/// CPU time of the measuring thread, not wall time: other tests run in
+/// parallel, and on a machine with fewer cores than runnable threads the wall
+/// time of a sample also counts the time the thread waits for a core. A cost
+/// measured that way under load and a job that later runs on an idle machine
+/// would make the job finish several times too early (CI did: a "6 s" run
+/// ended after 3 s). Load only ever makes a job slower than its CPU time.
 fn seconds_per_simulated_second() -> f64 {
     static COST: OnceLock<f64> = OnceLock::new();
     *COST.get_or_init(|| {
@@ -418,9 +422,9 @@ fn seconds_per_simulated_second() -> f64 {
                 1,
                 with_spacer,
             )]))[0];
-            let started = Instant::now();
+            let started = thread_cpu_time();
             lib::simulation::run_simulation(config, 0);
-            started.elapsed()
+            thread_cpu_time() - started
         };
         let mut duration_s = 0.05;
         let first = loop {
@@ -438,6 +442,27 @@ fn seconds_per_simulated_second() -> f64 {
             .fold(first, Duration::min);
         fastest.as_secs_f64() / duration_s
     })
+}
+
+/// The CPU time the calling thread has used so far.
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the call to fill in.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    assert_eq!(status, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
+/// Wall time elsewhere (no `libc` dependency): exposed to the load of the
+/// other tests, see [`seconds_per_simulated_second`].
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
 }
 
 /// The `duration_s` that makes one run of the heavy config take about `target`.
@@ -1743,8 +1768,10 @@ fn first_signal_stops_gracefully_and_resume_completes_to_identical_csvs(signal: 
     assert_results_are(&scratch, &expected);
 }
 
-/// Time the long run of the graceful-stop test takes in any build: longer than
-/// everything the test does before it lets the run finish.
+/// Time the long run of the graceful-stop test takes in any build: several
+/// times longer than everything the test does before it lets the run finish
+/// (about 1 s, see [`sweep_after_its_stop_at_deadline`]), so an imprecise
+/// [`seconds_per_simulated_second`] cannot make it end too early.
 const LONG_RUN: Duration = Duration::from_secs(6);
 
 const CTRL_C_AGAIN: &str = "Ctrl+C again";
@@ -1881,16 +1908,21 @@ fn the_first_signal_says_that_it_waits_and_that_ctrl_c_again_aborts(signal: &str
     );
 }
 
-/// A sweep whose `--stop-at` deadline (3 s after the launch) has been noticed
+/// A sweep whose `--stop-at` deadline (1 s after the launch) has been noticed
 /// by the idle worker while a long run of `long_s` simulated seconds is still
 /// in flight on the other one. Returns once the process has said so.
+///
+/// The deadline is as early as possible (the clock seam has whole seconds)
+/// because the long run of [`LONG_RUN`] must outlast it by a wide margin. Both
+/// workers take their first job well within that second (the first marker run
+/// is checkpointed after about 0.1 s, 0.4 s on an oversubscribed machine).
 fn sweep_after_its_stop_at_deadline(scratch_name: &str, long_s: f64) -> (Scratch, Proc) {
     let (scratch, mut proc) = sweep_with_a_long_run_in_flight(
         scratch_name,
         long_s,
         1_000_000,
         &["--stop-at", "11:00"],
-        &[("DPDS_SIM_FAKE_NOW", "10:59:57")],
+        &[("DPDS_SIM_FAKE_NOW", "10:59:59")],
     );
     wait_for_output(&mut proc, DEADLINE_REACHED);
     (scratch, proc)
